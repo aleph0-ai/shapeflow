@@ -1,0 +1,15 @@
+[package]
+name = "shapeflow-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "shapeflow_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["auto-initialize"] }
+shapeflow-core = { path = "../shapeflow-core" }
+thiserror.workspace = true
+toml.workspace = true

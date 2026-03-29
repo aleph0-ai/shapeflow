@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/shapeflow-core",
+    "crates/shapeflow-cli",
+    "crates/shapeflow-py",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause-Patent"
+
+[workspace.dependencies]
+anyhow = "1.0"
+camino = "1.1"
+ciborium = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+hound = "3.5"
+rayon = "1.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+hex = "0.4"
+libm = "0.2"
+proptest = "1.6"
+rand = "0.8"
+rand_chacha = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2.0"
+toml = "0.8"
+pyo3 = "0.28"
