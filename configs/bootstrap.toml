@@ -14,15 +14,17 @@ sound_sample_rate_hz = 44100
 sound_frames_per_second = 24
 sound_modulation_depth_per_mille = 250
 sound_channel_mapping = "stereo_alternating"
+text_reference_frame = "canonical"
+text_synonym_rate = 0.0
+text_typo_rate = 0.0
+image_frame_scatter = false
+image_arrow_type = "next"
 
 [positional_landscape]
 x_nonlinearity = "sigmoid"
 y_nonlinearity = "tanh"
 x_steepness = 3.0
 y_steepness = 2.0
-
-[split]
-policy = "standard"
 
 [parallelism]
 num_threads = 4

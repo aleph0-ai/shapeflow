@@ -3,8 +3,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use shapeflow_core::{
     OrderedQuadrantPassageTarget, SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig,
     canonical_scene_id, generate_ordered_quadrant_passage_targets, generate_scene,
-    generate_scene_text_lines, generate_tabular_motion_rows, render_scene_image_png,
-    render_scene_sound_wav, render_scene_video_frames_png, serialize_scene_text,
+    generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
+    render_scene_image_png_with_scene_config, render_scene_sound_wav,
+    render_scene_video_frames_png_with_keyframe_border, serialize_scene_text,
     serialize_tabular_motion_rows_csv, validate_ordered_quadrant_passage_targets,
 };
 
@@ -68,7 +69,7 @@ fn build_preview_artifacts(
     )
     .with_context(|| format!("failed to write tabular preview for scene_id={scene_id}"))?;
 
-    let text_lines = generate_scene_text_lines(&output)
+    let text_lines = generate_scene_text_lines_with_scene_config(&output, &config.scene)
         .with_context(|| format!("text generation failed for scene_index={scene_index}"))?;
     let text_body = serialize_scene_text(&text_lines);
     std::fs::write(
@@ -77,7 +78,7 @@ fn build_preview_artifacts(
     )
     .with_context(|| format!("failed to write text preview for scene_id={scene_id}"))?;
 
-    let image_png = render_scene_image_png(&output, config.scene.resolution)
+    let image_png = render_scene_image_png_with_scene_config(&output, &config.scene)
         .with_context(|| format!("image rendering failed for scene_index={scene_index}"))?;
     std::fs::write(scene_output_dir.join("image.png").as_std_path(), image_png)
         .with_context(|| format!("failed to write image preview for scene_id={scene_id}"))?;
@@ -93,8 +94,12 @@ fn build_preview_artifacts(
     std::fs::write(scene_output_dir.join("sound.wav").as_std_path(), sound_wav)
         .with_context(|| format!("failed to write sound preview for scene_id={scene_id}"))?;
 
-    let video_frames = render_scene_video_frames_png(&output, config.scene.resolution)
-        .with_context(|| format!("video frame rendering failed for scene_index={scene_index}"))?;
+    let video_frames = render_scene_video_frames_png_with_keyframe_border(
+        &output,
+        config.scene.resolution,
+        config.scene.video_keyframe_border,
+    )
+    .with_context(|| format!("video frame rendering failed for scene_index={scene_index}"))?;
     for (frame_index, frame_png) in video_frames.iter().enumerate() {
         let frame_name = format!("frame_{frame_index:06}.png");
         std::fs::write(video_frames_dir.join(frame_name).as_std_path(), frame_png).with_context(

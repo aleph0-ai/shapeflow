@@ -38,7 +38,10 @@ pub open spec fn cohort_size(scene_count: nat, cohort_index: nat) -> nat {
         }
 }
 
-pub open spec fn split_counts_for_policy(scene_count: nat, policy: SplitPolicyModel) -> (int, int, int) {
+pub open spec fn split_counts_for_policy(
+    scene_count: nat,
+    policy: SplitPolicyModel,
+) -> (int, int, int) {
     match policy {
         SplitPolicyModel::Standard => split_bucket_counts(scene_count),
         SplitPolicyModel::TheoryCohorts => {
@@ -78,7 +81,10 @@ pub proof fn split_bucket_counts_sum_to_scene_count(scene_count: nat) {
     assert(counts.0 + counts.1 + counts.2 == n);
 }
 
-pub proof fn split_counts_for_policy_sum_to_scene_count(scene_count: nat, policy: SplitPolicyModel) {
+pub proof fn split_counts_for_policy_sum_to_scene_count(
+    scene_count: nat,
+    policy: SplitPolicyModel,
+) {
     let cohort_sizes = (
         cohort_size(scene_count, 0nat),
         cohort_size(scene_count, 1nat),

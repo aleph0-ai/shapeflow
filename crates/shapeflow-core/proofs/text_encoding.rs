@@ -52,6 +52,38 @@ pub open spec fn pair_sentence_rank(shape_count: nat, left_shape: nat, right_sha
     (pair_row_start(shape_count, left_shape) as int + right_shape as int - left_shape as int - 1int) as nat
 }
 
+pub open spec fn pair_event_sentence_count(shape_count: nat, events_per_shape: nat) -> nat {
+    expected_event_count(shape_count, events_per_shape) * pair_sentence_count(shape_count)
+}
+
+pub open spec fn pair_event_sentence_rank(
+    shape_count: nat,
+    event_index: nat,
+    left_shape: nat,
+    right_shape: nat,
+) -> nat {
+    event_index * pair_sentence_count(shape_count) + pair_sentence_rank(shape_count, left_shape, right_shape)
+}
+
+pub open spec fn pair_event_sentence_covered(
+    shape_count: nat,
+    events_per_shape: nat,
+    event_index: nat,
+    left_shape: nat,
+    right_shape: nat,
+) -> bool {
+    event_index < expected_event_count(shape_count, events_per_shape)
+        && pair_sentence_covered(shape_count, left_shape, right_shape)
+}
+
+pub open spec fn expected_text_line_count_with_pair_event_coverage(
+    shape_count: nat,
+    events_per_shape: nat,
+) -> nat {
+    1 + expected_event_count(shape_count, events_per_shape)
+        + pair_event_sentence_count(shape_count, events_per_shape)
+}
+
 pub proof fn text_grammar_sentence_completeness_for_in_scope_scene_plan(
     shape_count: nat,
     events_per_shape: nat,
@@ -187,6 +219,44 @@ pub proof fn text_grammar_sentence_completeness_for_in_scope_scene_plan(
                 ==> left_1 == left_2 && right_1 == right_2);
     }
 
+}
+
+pub proof fn text_grammar_pair_event_completeness_for_in_scope_scene_plan(
+    shape_count: nat,
+    events_per_shape: nat,
+)
+    requires
+        2 <= shape_count,
+        shape_count <= 5,
+        1 <= events_per_shape,
+        events_per_shape <= 4,
+    ensures
+        expected_text_line_count_with_pair_event_coverage(shape_count, events_per_shape)
+            == 1 + expected_event_count(shape_count, events_per_shape)
+                + pair_event_sentence_count(shape_count, events_per_shape),
+        forall |event_index: nat, left_shape: nat, right_shape: nat|
+            event_index < expected_event_count(shape_count, events_per_shape)
+                && pair_sentence_covered(shape_count, left_shape, right_shape)
+                ==> pair_event_sentence_covered(
+                    shape_count,
+                    events_per_shape,
+                    event_index,
+                    left_shape,
+                    right_shape,
+                ),
+{
+    text_grammar_sentence_completeness_for_in_scope_scene_plan(shape_count, events_per_shape);
+
+    assert(forall |event_index: nat, left_shape: nat, right_shape: nat|
+        event_index < expected_event_count(shape_count, events_per_shape)
+            && pair_sentence_covered(shape_count, left_shape, right_shape)
+            ==> pair_event_sentence_covered(
+                shape_count,
+                events_per_shape,
+                event_index,
+                left_shape,
+                right_shape,
+            ));
 }
 
 } // verus!

@@ -2,8 +2,7 @@ use anyhow::{Context, Result, ensure};
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use shapeflow_core::{
-    SceneSplitAssignment, ShapeFlowConfig, SplitAssignmentSummary, SplitPolicyConfig,
-    build_split_assignments,
+    SceneSplitAssignment, ShapeFlowConfig, SplitAssignmentSummary, build_split_assignments,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,7 +10,6 @@ pub(crate) struct SplitAssignmentsMetadataRecord {
     pub(crate) master_seed: u64,
     pub(crate) config_hash: String,
     pub(crate) schema_version: u32,
-    pub(crate) split_policy: SplitPolicyConfig,
     pub(crate) summary: SplitAssignmentSummary,
     pub(crate) assignments: Vec<SceneSplitAssignment>,
 }
@@ -58,10 +56,6 @@ pub(crate) fn validate_generated_split_assignments_metadata(
         config.schema_version
     );
     ensure!(
-        metadata.split_policy == config.split.policy,
-        "generated split-assignment metadata split policy mismatch with config"
-    );
-    ensure!(
         metadata.assignments.len() == metadata.summary.total_count,
         "generated split-assignment metadata summary total_count mismatch: summary_total={}, assignments_len={}",
         metadata.summary.total_count,
@@ -77,7 +71,7 @@ pub(crate) fn validate_generated_split_assignments_metadata(
         metadata.summary.total_count
     );
 
-    let expected = build_split_assignments(scene_count, &config.split).with_context(|| {
+    let expected = build_split_assignments(scene_count).with_context(|| {
         format!("failed to build expected split assignments for scene_count={scene_count}")
     })?;
 

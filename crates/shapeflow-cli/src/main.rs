@@ -277,6 +277,10 @@ fn run_hash_config(config_path: Utf8PathBuf) -> Result<()> {
     let identity = config.dataset_identity()?;
     println!("master_seed={}", identity.master_seed);
     println!("config_hash={}", identity.config_hash_hex);
+    if let Some(profile) = identity.generation_profile {
+        println!("generation_profile={}", profile.name);
+        println!("generation_profile_version={}", profile.version);
+    }
     Ok(())
 }
 

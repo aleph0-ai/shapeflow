@@ -4,6 +4,19 @@ use std::io::Cursor;
 use crate::config::{EasingFamily, SoundChannelMapping};
 use crate::scene_generation::SceneGenerationOutput;
 
+const COLOR_PALETTE_SIZE: usize = 8;
+const SHAPE_TYPE_PALETTE_SIZE: usize = 5;
+const PULSE_DUTY_CYCLE: f64 = 0.25;
+
+#[derive(Clone, Copy)]
+enum SoundShapeWaveform {
+    Sine,
+    Triangle,
+    Square,
+    Sawtooth,
+    Pulse,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SoundEncodingError {
     #[error("invalid sample rate: {sample_rate_hz}")]
@@ -116,6 +129,8 @@ pub fn render_scene_sound_wav(
         let samples_per_event =
             samples_for_duration(expected_duration_frames, sample_rate_hz, frames_per_second)?;
         let event_gain = (i16::MAX as f64) * 0.35 / (slot_events.len() as f64).max(1.0);
+        let modulation_depth = f64::from(modulation_depth_per_mille) / 1000.0;
+
         for sample_index in 0..samples_per_event {
             let t = slot_progress(sample_index, samples_per_event);
             let mut mono = 0.0_f64;
@@ -126,21 +141,22 @@ pub fn render_scene_sound_wav(
                 let eased = easing_progress(t, event.easing);
                 let x = lerp(event.start_point.x, event.end_point.x, eased);
                 let y = lerp(event.start_point.y, event.end_point.y, eased);
-                let frequency =
-                    modulated_frequency(event.shape_index, x, y, modulation_depth_per_mille);
+                let base_frequency = base_frequency_for_shape(event.shape_index);
+                let waveform = waveform_for_shape(event.shape_index);
+                let frequency = modulated_frequency(base_frequency, x, modulation_depth);
+                let amplitude = modulated_amplitude(event_gain, y, modulation_depth);
                 let sample_time = sample_index as f64 / sample_rate_hz as f64;
-                let wave = (2.0 * PI * frequency * sample_time).sin() * event_gain;
+                let phase = frequency * sample_time;
+                let wave = waveform_sample(waveform, phase) * amplitude;
 
                 match channel_mapping {
                     SoundChannelMapping::MonoMix => {
                         mono += wave;
                     }
                     SoundChannelMapping::StereoAlternating => {
-                        if event.shape_index % 2 == 0 {
-                            left += wave;
-                        } else {
-                            right += wave;
-                        }
+                        let (left_gain, right_gain) = pan_from_x_position(x);
+                        left += wave * left_gain;
+                        right += wave * right_gain;
                     }
                 }
             }
@@ -202,12 +218,66 @@ fn slot_progress(sample_index: usize, sample_count: usize) -> f64 {
     sample_index as f64 / (sample_count - 1) as f64
 }
 
-fn modulated_frequency(shape_index: usize, x: f64, y: f64, modulation_depth_per_mille: u16) -> f64 {
-    let base = 220.0 * (1.0 + shape_index as f64 * 0.15);
-    let position_mix = ((x + y) * 0.25 + 0.5).clamp(0.0, 1.0);
-    let modulation =
-        1.0 + (f64::from(modulation_depth_per_mille) / 1000.0) * (position_mix * 2.0 - 1.0);
-    base * modulation
+fn base_frequency_for_shape(shape_index: usize) -> f64 {
+    let color_index = color_index_for_shape(shape_index);
+    220.0 * 2.0_f64.powf(color_index as f64 / COLOR_PALETTE_SIZE as f64)
+}
+
+fn color_index_for_shape(shape_index: usize) -> usize {
+    shape_index % COLOR_PALETTE_SIZE
+}
+
+fn shape_type_index(shape_index: usize) -> usize {
+    shape_index % SHAPE_TYPE_PALETTE_SIZE
+}
+
+fn waveform_for_shape(shape_index: usize) -> SoundShapeWaveform {
+    match shape_type_index(shape_index) {
+        0 => SoundShapeWaveform::Sine,
+        1 => SoundShapeWaveform::Triangle,
+        2 => SoundShapeWaveform::Square,
+        3 => SoundShapeWaveform::Sawtooth,
+        _ => SoundShapeWaveform::Pulse,
+    }
+}
+
+fn modulated_frequency(base_frequency: f64, x: f64, modulation_depth: f64) -> f64 {
+    let clamped_x = x.clamp(-1.0, 1.0);
+    base_frequency * (1.0 + modulation_depth * clamped_x)
+}
+
+fn modulated_amplitude(event_gain: f64, y: f64, modulation_depth: f64) -> f64 {
+    let clamped_y = y.clamp(-1.0, 1.0);
+    event_gain * (1.0 + modulation_depth * clamped_y)
+}
+
+fn pan_from_x_position(x: f64) -> (f64, f64) {
+    let clamped_x = x.clamp(-1.0, 1.0);
+    let pan = (clamped_x + 1.0) * 0.5;
+    (1.0 - pan, pan)
+}
+
+fn waveform_sample(shape_waveform: SoundShapeWaveform, phase: f64) -> f64 {
+    let periodic_phase = phase - phase.floor();
+    match shape_waveform {
+        SoundShapeWaveform::Sine => (2.0 * PI * periodic_phase).sin(),
+        SoundShapeWaveform::Triangle => 2.0 * (2.0 * periodic_phase - 1.0).abs() - 1.0,
+        SoundShapeWaveform::Square => {
+            if periodic_phase < 0.5 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        SoundShapeWaveform::Sawtooth => 2.0 * periodic_phase - 1.0,
+        SoundShapeWaveform::Pulse => {
+            if periodic_phase < PULSE_DUTY_CYCLE {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+    }
 }
 
 fn clamp_i16(sample: f64) -> i16 {
@@ -259,6 +329,70 @@ mod tests {
             projection: SceneProjectionMode::TrajectoryOnly,
         };
         generate_scene(&params).expect("scene generation should succeed")
+    }
+
+    fn synthesize_single_event_scene(
+        shape_count: usize,
+        shape_index: usize,
+        point: NormalizedPoint,
+    ) -> SceneGenerationOutput {
+        let mut generated_per_shape = vec![0_u16; shape_count];
+        generated_per_shape[shape_index] = generated_per_shape[shape_index]
+            .checked_add(1)
+            .expect("per-shape count should fit u16");
+
+        SceneGenerationOutput {
+            scene_index: 0,
+            schedule: SceneSeedSchedule::derive(7, 0),
+            shape_paths: (0..shape_count)
+                .map(|idx| SceneShapePath {
+                    shape_index: idx,
+                    trajectory_points: vec![point, point],
+                    soft_memberships: None,
+                })
+                .collect(),
+            motion_events: vec![MotionEvent {
+                global_event_index: 0,
+                time_slot: 0,
+                shape_index,
+                shape_event_index: 0,
+                start_point: point,
+                end_point: point,
+                duration_frames: 24,
+                easing: EasingFamily::Linear,
+            }],
+            accounting: MotionEventAccounting {
+                expected_total: 1,
+                generated_total: 1,
+                expected_per_shape: generated_per_shape.clone(),
+                generated_per_shape,
+            },
+        }
+    }
+
+    fn decode_i16_samples(wav_bytes: &[u8]) -> Vec<i16> {
+        let mut reader =
+            hound::WavReader::new(Cursor::new(wav_bytes)).expect("generated wav should parse");
+        reader
+            .samples::<i16>()
+            .map(|sample| sample.expect("sample should decode"))
+            .collect()
+    }
+
+    fn split_stereo_samples(wav_bytes: &[u8]) -> (Vec<i16>, Vec<i16>) {
+        let interleaved = decode_i16_samples(wav_bytes);
+        (
+            interleaved.iter().step_by(2).copied().collect(),
+            interleaved.iter().skip(1).step_by(2).copied().collect(),
+        )
+    }
+
+    fn mean_abs_sample(samples: &[i16]) -> f64 {
+        let sum = samples
+            .iter()
+            .map(|sample| f64::from(*sample).abs())
+            .sum::<f64>();
+        sum / samples.len() as f64
     }
 
     #[test]
@@ -402,5 +536,184 @@ mod tests {
                 global_event_index: 7
             }
         ));
+    }
+
+    #[test]
+    fn render_scene_sound_wav_shape_color_affects_base_frequency() {
+        let config = bootstrap_config();
+        let red_scene = synthesize_single_event_scene(
+            2,
+            0,
+            NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+        );
+        let blue_scene = synthesize_single_event_scene(
+            2,
+            1,
+            NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+        );
+
+        let red_bytes = render_scene_sound_wav(
+            &red_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::MonoMix,
+        )
+        .expect("rendering should succeed");
+        let blue_bytes = render_scene_sound_wav(
+            &blue_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::MonoMix,
+        )
+        .expect("rendering should succeed");
+
+        let red_samples = decode_i16_samples(&red_bytes);
+        let blue_samples = decode_i16_samples(&blue_bytes);
+        assert!(
+            red_samples
+                .iter()
+                .zip(blue_samples.iter())
+                .any(|(left, right)| left != right),
+            "different colors should drive different base frequencies"
+        );
+    }
+
+    #[test]
+    fn render_scene_sound_wav_shape_type_affects_waveform() {
+        let config = bootstrap_config();
+        let circle_scene = synthesize_single_event_scene(
+            9,
+            0,
+            NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+        );
+        let pentagon_scene = synthesize_single_event_scene(
+            9,
+            8,
+            NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+        );
+
+        let circle_bytes = render_scene_sound_wav(
+            &circle_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::MonoMix,
+        )
+        .expect("rendering should succeed");
+        let pentagon_bytes = render_scene_sound_wav(
+            &pentagon_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::MonoMix,
+        )
+        .expect("rendering should succeed");
+
+        let circle_samples = decode_i16_samples(&circle_bytes);
+        let pentagon_samples = decode_i16_samples(&pentagon_bytes);
+        assert!(
+            circle_samples
+                .iter()
+                .zip(pentagon_samples.iter())
+                .any(|(left, right)| left != right),
+            "different shape types should affect waveform signature"
+        );
+    }
+
+    #[test]
+    fn render_scene_sound_wav_y_position_affects_amplitude() {
+        let config = bootstrap_config();
+        let low_scene = synthesize_single_event_scene(
+            1,
+            0,
+            NormalizedPoint::new(0.0, -1.0).expect("point must build"),
+        );
+        let high_scene = synthesize_single_event_scene(
+            1,
+            0,
+            NormalizedPoint::new(0.0, 1.0).expect("point must build"),
+        );
+
+        let low_bytes = render_scene_sound_wav(
+            &low_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::MonoMix,
+        )
+        .expect("rendering should succeed");
+        let high_bytes = render_scene_sound_wav(
+            &high_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::MonoMix,
+        )
+        .expect("rendering should succeed");
+
+        let low_samples = decode_i16_samples(&low_bytes);
+        let high_samples = decode_i16_samples(&high_bytes);
+        assert!(
+            mean_abs_sample(&high_samples) > mean_abs_sample(&low_samples) * 1.5,
+            "high y should increase sample amplitude"
+        );
+    }
+
+    #[test]
+    fn render_scene_sound_wav_stereo_panning_tracks_x_position() {
+        let config = bootstrap_config();
+        let left_scene = synthesize_single_event_scene(
+            1,
+            0,
+            NormalizedPoint::new(-1.0, 0.0).expect("point must build"),
+        );
+        let right_scene = synthesize_single_event_scene(
+            1,
+            0,
+            NormalizedPoint::new(1.0, 0.0).expect("point must build"),
+        );
+        let center_scene = synthesize_single_event_scene(
+            1,
+            0,
+            NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+        );
+
+        let left_bytes = render_scene_sound_wav(
+            &left_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::StereoAlternating,
+        )
+        .expect("rendering should succeed");
+        let right_bytes = render_scene_sound_wav(
+            &right_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::StereoAlternating,
+        )
+        .expect("rendering should succeed");
+        let center_bytes = render_scene_sound_wav(
+            &center_scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            SoundChannelMapping::StereoAlternating,
+        )
+        .expect("rendering should succeed");
+
+        let (left_only_l, left_only_r) = split_stereo_samples(&left_bytes);
+        let (right_only_l, right_only_r) = split_stereo_samples(&right_bytes);
+        let (center_l, center_r) = split_stereo_samples(&center_bytes);
+
+        assert!(left_only_r.iter().all(|sample| *sample == 0));
+        assert!(right_only_l.iter().all(|sample| *sample == 0));
+        assert!(center_l.iter().any(|sample| *sample != 0));
+        assert!(center_r.iter().any(|sample| *sample != 0));
+        assert!(!left_only_l.iter().all(|sample| *sample == 0));
+        assert!(!right_only_r.iter().all(|sample| *sample == 0));
     }
 }

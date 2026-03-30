@@ -70,7 +70,7 @@ pub fn validate_site_graph(
 pub fn validate_site_graph_with_artifact(
     config: &ShapeFlowConfig,
 ) -> Result<(SiteGraphValidationReport, SiteGraphArtifact), SiteGraphValidationError> {
-    if config.site_graph.site_k == 0 || config.site_graph.validation_scene_count == 0 {
+    if config.site_graph.validation_scene_count == 0 {
         return Err(SiteGraphValidationError::InvalidGraphSizeOrK {
             scene_count: config.site_graph.validation_scene_count,
             site_k: config.site_graph.site_k,
@@ -78,17 +78,6 @@ pub fn validate_site_graph_with_artifact(
     }
 
     let scene_count = config.site_graph.validation_scene_count as usize;
-    let effective_k = std::cmp::min(
-        config.site_graph.site_k as usize,
-        scene_count.saturating_sub(1),
-    );
-    if effective_k == 0 {
-        return Err(SiteGraphValidationError::InvalidGraphSizeOrK {
-            scene_count: config.site_graph.validation_scene_count,
-            site_k: config.site_graph.site_k,
-        });
-    }
-
     let mut scene_vectors = Vec::with_capacity(scene_count);
     for scene_index in 0..config.site_graph.validation_scene_count {
         let params = SceneGenerationParams {
@@ -103,14 +92,54 @@ pub fn validate_site_graph_with_artifact(
         scene_vectors.push(vector);
     }
 
-    let graph = build_undirected_knn_graph(&scene_vectors, effective_k);
+    validate_site_graph_for_latent_vectors(
+        &scene_vectors,
+        config.site_graph.site_k,
+        config.site_graph.lambda2_min,
+        config.site_graph.lambda2_iterations,
+        config.master_seed,
+        config.schema_version,
+    )
+}
+
+pub fn validate_site_graph_for_latent_vectors(
+    latent_vectors: &[Vec<f64>],
+    site_k: u32,
+    lambda2_min: f64,
+    lambda2_iterations: u32,
+    master_seed: u64,
+    schema_version: u32,
+) -> Result<(SiteGraphValidationReport, SiteGraphArtifact), SiteGraphValidationError> {
+    let scene_count_u32 = u32::try_from(latent_vectors.len()).unwrap_or(u32::MAX);
+    if site_k == 0 || latent_vectors.is_empty() {
+        return Err(SiteGraphValidationError::InvalidGraphSizeOrK {
+            scene_count: scene_count_u32,
+            site_k,
+        });
+    }
+
+    for (scene_index, vector) in latent_vectors.iter().enumerate() {
+        let scene_index_u32 = u32::try_from(scene_index).unwrap_or(u32::MAX);
+        validate_vector_length(latent_vectors, scene_index_u32, vector.len())?;
+    }
+
+    let scene_count = latent_vectors.len();
+    let effective_k = std::cmp::min(site_k as usize, scene_count.saturating_sub(1));
+    if effective_k == 0 {
+        return Err(SiteGraphValidationError::InvalidGraphSizeOrK {
+            scene_count: scene_count_u32,
+            site_k,
+        });
+    }
+
+    let graph = build_undirected_knn_graph(latent_vectors, effective_k);
     let (degree_stats, components) = graph_statistics(&graph.adjacency);
 
     if components != 1 {
         return Err(SiteGraphValidationError::DisconnectedGraph { components });
     }
 
-    let site_k_cap = config.site_graph.site_k.saturating_mul(5);
+    let site_k_cap = site_k.saturating_mul(5);
     if degree_stats.max_degree > site_k_cap {
         return Err(SiteGraphValidationError::HubDegreeCapExceeded {
             max_degree: degree_stats.max_degree,
@@ -120,24 +149,24 @@ pub fn validate_site_graph_with_artifact(
 
     let lambda2_estimate = estimate_lambda2(
         &graph.adjacency,
-        usize::try_from(config.site_graph.lambda2_iterations).unwrap_or(usize::MAX),
-        config.master_seed,
+        usize::try_from(lambda2_iterations).unwrap_or(usize::MAX),
+        master_seed,
     )?;
     if !lambda2_estimate.is_finite() {
         return Err(SiteGraphValidationError::NonFiniteLambda2 {
             value: lambda2_estimate,
         });
     }
-    if lambda2_estimate < config.site_graph.lambda2_min {
+    if lambda2_estimate < lambda2_min {
         return Err(SiteGraphValidationError::Lambda2BelowThreshold {
             estimate: lambda2_estimate,
-            threshold: config.site_graph.lambda2_min,
+            threshold: lambda2_min,
         });
     }
 
     let artifact = SiteGraphArtifact {
-        schema_version: config.schema_version,
-        node_count: config.site_graph.validation_scene_count,
+        schema_version,
+        node_count: scene_count_u32,
         edges: graph.edges,
         lambda2_estimate,
         degree_stats,
@@ -145,14 +174,14 @@ pub fn validate_site_graph_with_artifact(
 
     let undirected_edge_count = u32::try_from(artifact.edges.len()).map_err(|_| {
         SiteGraphValidationError::InvalidGraphSizeOrK {
-            scene_count: config.site_graph.validation_scene_count,
-            site_k: config.site_graph.site_k,
+            scene_count: scene_count_u32,
+            site_k,
         }
     })?;
 
     let report = SiteGraphValidationReport {
-        scene_count: config.site_graph.validation_scene_count,
-        site_k: config.site_graph.site_k,
+        scene_count: scene_count_u32,
+        site_k,
         effective_k: effective_k as u32,
         undirected_edge_count,
         connected_components: components,
@@ -317,7 +346,11 @@ fn projected_power_beta(max_degree: u32) -> f64 {
 }
 
 fn lambda2_rng_seed(master_seed: u64) -> u64 {
-    master_seed.wrapping_add(LAMBDA2_RANDOM_OFFSET)
+    master_seed.checked_add(LAMBDA2_RANDOM_OFFSET).unwrap_or_else(|| {
+        panic!(
+            "lambda2 RNG seed overflow: master_seed={master_seed}, offset={LAMBDA2_RANDOM_OFFSET}"
+        )
+    })
 }
 
 fn initialize_lambda2_start_vector(node_count: usize, master_seed: u64) -> Vec<f64> {
@@ -491,8 +524,8 @@ mod tests {
     use super::*;
 
     use crate::config::{
-        AxisNonlinearityFamily, ConfigError, EasingFamily, ParallelismConfig,
-        PositionalLandscapeConfig, SceneConfig, SoundChannelMapping, SplitConfig,
+        AxisNonlinearityFamily, ConfigError, EasingFamily, ImageArrowType, ParallelismConfig,
+        PositionalLandscapeConfig, SceneConfig, SoundChannelMapping, TextReferenceFrame,
     };
     use std::collections::BTreeSet;
 
@@ -500,6 +533,7 @@ mod tests {
         ShapeFlowConfig {
             schema_version: 1,
             master_seed: 1234,
+            generation_profile: None,
             scene: SceneConfig {
                 resolution: 512,
                 n_shapes: 2,
@@ -513,15 +547,18 @@ mod tests {
                 sound_frames_per_second: 24,
                 sound_modulation_depth_per_mille: 250,
                 sound_channel_mapping: SoundChannelMapping::StereoAlternating,
+                text_reference_frame: TextReferenceFrame::Canonical,
+                text_synonym_rate: 0.0,
+                text_typo_rate: 0.0,
+                video_keyframe_border: false,
+                image_frame_scatter: false,
+                image_arrow_type: ImageArrowType::Next,
             },
             positional_landscape: PositionalLandscapeConfig {
                 x_nonlinearity: AxisNonlinearityFamily::Sigmoid,
                 y_nonlinearity: AxisNonlinearityFamily::Tanh,
                 x_steepness: 3.0,
                 y_steepness: 2.0,
-            },
-            split: SplitConfig {
-                policy: crate::config::SplitPolicyConfig::Standard,
             },
             parallelism: ParallelismConfig { num_threads: 4 },
             site_graph: crate::config::SiteGraphConfig {
@@ -557,6 +594,39 @@ mod tests {
         let (report_with_artifact, _artifact) =
             validate_site_graph_with_artifact(&config).expect("validation should succeed");
         assert_eq!(report_only, report_with_artifact);
+    }
+
+    #[test]
+    fn validate_site_graph_for_latent_vectors_matches_config_driven_path() {
+        let config = sample_config();
+        let mut vectors = Vec::with_capacity(config.site_graph.validation_scene_count as usize);
+        for scene_index in 0..config.site_graph.validation_scene_count {
+            let params = SceneGenerationParams {
+                config: &config,
+                scene_index: u64::from(scene_index),
+                samples_per_event: 2,
+                projection: SceneProjectionMode::TrajectoryOnly,
+            };
+            let scene = generate_scene(&params).expect("scene generation should succeed");
+            vectors.push(
+                extract_latent_vector_from_scene(&scene).expect("latent extraction should work"),
+            );
+        }
+
+        let (from_vectors_report, from_vectors_artifact) = validate_site_graph_for_latent_vectors(
+            &vectors,
+            config.site_graph.site_k,
+            config.site_graph.lambda2_min,
+            config.site_graph.lambda2_iterations,
+            config.master_seed,
+            config.schema_version,
+        )
+        .expect("latent-vector validation should succeed");
+        let (from_config_report, from_config_artifact) =
+            validate_site_graph_with_artifact(&config).expect("config path should succeed");
+
+        assert_eq!(from_vectors_report, from_config_report);
+        assert_eq!(from_vectors_artifact, from_config_artifact);
     }
 
     #[test]
@@ -1421,22 +1491,27 @@ mod tests {
     }
 
     #[test]
-    fn lambda2_rng_seed_uses_wrapping_offset_addition() {
-        let seed = u64::MAX - 3;
-        let expected = seed.wrapping_add(LAMBDA2_RANDOM_OFFSET);
+    fn lambda2_rng_seed_uses_checked_offset_addition() {
+        let seed = 123_u64;
+        let expected = seed + LAMBDA2_RANDOM_OFFSET;
         assert_eq!(lambda2_rng_seed(seed), expected);
     }
 
     #[test]
-    fn lambda2_rng_seed_preserves_wrapping_seed_difference() {
-        let larger_seed = u64::MAX - 17;
+    fn lambda2_rng_seed_preserves_seed_difference_without_overflow() {
+        let larger_seed = 50_000_u64;
         let smaller_seed = 42_u64;
 
-        let expected_difference = larger_seed.wrapping_sub(smaller_seed);
-        let actual_difference =
-            lambda2_rng_seed(larger_seed).wrapping_sub(lambda2_rng_seed(smaller_seed));
+        let expected_difference = larger_seed - smaller_seed;
+        let actual_difference = lambda2_rng_seed(larger_seed) - lambda2_rng_seed(smaller_seed);
 
         assert_eq!(actual_difference, expected_difference);
+    }
+
+    #[test]
+    #[should_panic(expected = "lambda2 RNG seed overflow")]
+    fn lambda2_rng_seed_panics_on_overflow() {
+        let _ = lambda2_rng_seed(u64::MAX);
     }
 
     #[test]

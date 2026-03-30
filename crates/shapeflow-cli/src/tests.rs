@@ -6,8 +6,9 @@ use shapeflow_core::{
     LatentArtifact, SceneGenerationParams, SceneProjectionMode, TargetArtifact, canonical_scene_id,
     deserialize_latent_artifact, deserialize_site_graph_artifact, deserialize_target_artifact,
     extract_latent_vector_from_scene, generate_ordered_quadrant_passage_targets, generate_scene,
-    generate_scene_text_lines, generate_tabular_motion_rows, render_scene_image_png,
-    render_scene_sound_wav, render_scene_video_frames_png, serialize_latent_artifact,
+    generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
+    render_scene_image_png_with_scene_config, render_scene_sound_wav,
+    render_scene_video_frames_png_with_keyframe_border, serialize_latent_artifact,
     serialize_scene_text, serialize_site_graph_artifact, serialize_tabular_motion_rows_csv,
     serialize_target_artifact, validate_site_graph_with_artifact,
 };
@@ -1502,125 +1503,6 @@ fn generate_smoke_bootstrap_config() {
 }
 
 #[test]
-fn generate_theory_cohorts_routes_per_cohort_deterministically() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let bootstrap_config_path = Utf8PathBuf::from_path_buf(
-        manifest_dir
-            .join("../../configs/bootstrap.toml")
-            .to_path_buf(),
-    )
-    .expect("bootstrap config path should be utf-8");
-    let mut config = load_config(bootstrap_config_path).expect("bootstrap config should load");
-    config.split.policy = shapeflow_core::SplitPolicyConfig::TheoryCohorts;
-    config
-        .validate()
-        .expect("theory cohorts split policy should validate");
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock should be after unix epoch")
-        .as_nanos();
-    let temp_root = std::env::temp_dir().join(format!("shapeflow-generate-theory-cohorts-{nanos}"));
-    let temp_root_path =
-        Utf8PathBuf::from_path_buf(temp_root.clone()).expect("temp output path should be utf-8");
-    let config_path = temp_root_path.join("config.toml");
-    let config_toml =
-        toml::to_string_pretty(&config).expect("policy-mutated config should serialize");
-    std::fs::create_dir_all(temp_root_path.as_std_path()).expect("temp root should be creatable");
-    std::fs::write(config_path.as_std_path(), config_toml).expect("temp config should be writable");
-
-    let output_path = temp_root_path.join("output");
-    run_generate(config_path, output_path.clone(), 10, 24)
-        .expect("generate should succeed for theory-cohorts policy");
-
-    let split_assignments = std::fs::read_to_string(
-        output_path
-            .join("metadata/split_assignments.toml")
-            .as_std_path(),
-    )
-    .expect("split assignments metadata should be readable");
-    let split_assignments_value: toml::Value =
-        toml::from_str(&split_assignments).expect("split assignments metadata should parse");
-    assert_eq!(
-        split_assignments_value
-            .get("split_policy")
-            .and_then(|value| value.as_str())
-            .expect("split assignments should include split_policy"),
-        "theory_cohorts"
-    );
-    let summary = split_assignments_value
-        .get("summary")
-        .and_then(|value| value.as_table())
-        .expect("split assignments should include summary table");
-    assert_eq!(
-        summary
-            .get("train_count")
-            .and_then(|value| value.as_integer())
-            .expect("summary should include train_count"),
-        5
-    );
-    assert_eq!(
-        summary
-            .get("val_count")
-            .and_then(|value| value.as_integer())
-            .expect("summary should include val_count"),
-        0
-    );
-    assert_eq!(
-        summary
-            .get("test_count")
-            .and_then(|value| value.as_integer())
-            .expect("summary should include test_count"),
-        5
-    );
-
-    let assignments = split_assignments_value
-        .get("assignments")
-        .and_then(|value| value.as_array())
-        .expect("split assignments should include assignments array");
-    assert_eq!(
-        assignments.len(),
-        10,
-        "theory-cohorts scene_count=10 should produce 10 assignments"
-    );
-    for (scene_index, entry) in assignments.iter().enumerate() {
-        let scene_id = entry
-            .get("scene_id")
-            .and_then(|value| value.as_str())
-            .expect("assignment should include scene_id");
-        assert_eq!(scene_id, format!("scene_{scene_index:06}"));
-        let split = entry
-            .get("split")
-            .and_then(|value| value.as_str())
-            .expect("assignment should include split");
-        let cohort = entry
-            .get("cohort")
-            .and_then(|value| value.as_str())
-            .expect("assignment should include cohort");
-        let cohort_index = (scene_index % 5) as usize;
-        let expected_cohort = ["a", "b", "c", "d", "e"][cohort_index];
-        assert_eq!(cohort, expected_cohort);
-        let cohort_offset = scene_index / 5;
-        let expected_split = if cohort_offset == 0 { "train" } else { "test" };
-        assert_eq!(split, expected_split);
-        if scene_index < 5 {
-            assert_eq!(split, "train");
-        } else {
-            assert_eq!(split, "test");
-        }
-    }
-    assert!(assignments.iter().all(|entry| {
-        let cohort = entry
-            .get("cohort")
-            .and_then(|value| value.as_str())
-            .expect("assignment should include cohort");
-        matches!(cohort, "a" | "b" | "c" | "d" | "e")
-    }));
-
-    std::fs::remove_dir_all(temp_root).expect("temp root should be removable");
-}
-
-#[test]
 fn generate_smoke_bootstrap_config_matches_core_artifacts() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let config_path = Utf8PathBuf::from_path_buf(
@@ -1728,7 +1610,8 @@ fn generate_smoke_bootstrap_config_matches_core_artifacts() {
             "tabular CSV should match core-generated tabular serialization"
         );
         let expected_text_lines =
-            generate_scene_text_lines(&output).expect("text lines should generate");
+            generate_scene_text_lines_with_scene_config(&output, &output_config.scene)
+                .expect("text lines should generate");
         let expected_text = serialize_scene_text(&expected_text_lines);
         let text_path = output_path.join("text").join(format!("{scene_id}.txt"));
         let text = std::fs::read_to_string(text_path.as_std_path())
@@ -1737,8 +1620,9 @@ fn generate_smoke_bootstrap_config_matches_core_artifacts() {
             text, expected_text,
             "text artifact should match core-generated text serialization"
         );
-        let expected_image = render_scene_image_png(&output, output_config.scene.resolution)
-            .expect("image should render");
+        let expected_image =
+            render_scene_image_png_with_scene_config(&output, &output_config.scene)
+                .expect("image should render");
         let image_path = output_path.join("image").join(format!("{scene_id}.png"));
         let image_bytes =
             std::fs::read(image_path.as_std_path()).expect("image artifact should be readable");
@@ -1761,9 +1645,12 @@ fn generate_smoke_bootstrap_config_matches_core_artifacts() {
             sound_bytes, expected_sound,
             "sound artifact should match core-generated sound serialization for scene {scene_id}"
         );
-        let expected_video_frames =
-            render_scene_video_frames_png(&output, output_config.scene.resolution)
-                .expect("video frames should render");
+        let expected_video_frames = render_scene_video_frames_png_with_keyframe_border(
+            &output,
+            output_config.scene.resolution,
+            output_config.scene.video_keyframe_border,
+        )
+        .expect("video frames should render");
         let video_scene_dir = output_path.join("video_frames").join(&scene_id);
         for (frame_index, expected_frame) in expected_video_frames.iter().enumerate() {
             let frame_path = video_scene_dir.join(format!("frame_{frame_index:06}.png"));

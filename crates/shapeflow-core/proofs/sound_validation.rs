@@ -10,11 +10,44 @@ use vstd::prelude::*;
 
 verus! {
 
-pub uninterp spec fn rounded_up_slot_samples(
+pub open spec fn rounded_up_slot_samples(
     duration_frames: nat,
     sample_rate_hz: nat,
     frames_per_second: nat,
-) -> nat;
+) -> nat {
+    if frames_per_second == 0 {
+        0
+    } else {
+        let numerator = duration_frames * sample_rate_hz;
+        numerator / frames_per_second
+            + if numerator % frames_per_second == 0 {
+                0nat
+            } else {
+                1nat
+            }
+    }
+}
+
+pub proof fn rounded_up_slot_samples_formula_matches_runtime(
+    duration_frames: nat,
+    sample_rate_hz: nat,
+    frames_per_second: nat,
+)
+    requires
+        frames_per_second > 0,
+    ensures
+        rounded_up_slot_samples(duration_frames, sample_rate_hz, frames_per_second)
+            == {
+                let numerator = duration_frames * sample_rate_hz;
+                numerator / frames_per_second
+                    + if numerator % frames_per_second == 0 {
+                        0nat
+                    } else {
+                        1nat
+                    }
+            },
+{
+}
 
 pub open spec fn total_slot_samples(
     slot_durations: Seq<nat>,
@@ -126,6 +159,23 @@ pub proof fn total_slot_samples_two_slots(
     assert(total_slot_samples(rhs, sample_rate_hz, frames_per_second)
         == rounded_up_slot_samples(slot1_duration, sample_rate_hz, frames_per_second));
 
+    assert(total_slot_samples(seq![], sample_rate_hz, frames_per_second) == 0);
+}
+
+pub proof fn total_slot_samples_single_slot(
+    slot_duration: nat,
+    sample_rate_hz: nat,
+    frames_per_second: nat,
+)
+    ensures
+        total_slot_samples(seq![slot_duration], sample_rate_hz, frames_per_second)
+            == rounded_up_slot_samples(slot_duration, sample_rate_hz, frames_per_second),
+{
+    total_slot_samples_nonempty_unfold(seq![slot_duration], sample_rate_hz, frames_per_second);
+    assert(total_slot_samples(seq![slot_duration], sample_rate_hz, frames_per_second)
+        == rounded_up_slot_samples(slot_duration, sample_rate_hz, frames_per_second)
+            + total_slot_samples(seq![], sample_rate_hz, frames_per_second));
+    total_slot_samples_empty_is_zero(sample_rate_hz, frames_per_second);
     assert(total_slot_samples(seq![], sample_rate_hz, frames_per_second) == 0);
 }
 

@@ -4,6 +4,8 @@ use crate::tabular_encoding::shape_identity_for_index;
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder, Rgb, RgbImage};
 
+const KEYFRAME_BORDER_COLOR: Rgb<u8> = Rgb([220, 20, 60]);
+
 #[derive(Debug, thiserror::Error)]
 pub enum VideoEncodingError {
     #[error("resolution must be > 0")]
@@ -35,6 +37,14 @@ pub enum VideoEncodingError {
 pub fn render_scene_video_frames_png(
     scene: &SceneGenerationOutput,
     resolution: u32,
+) -> Result<Vec<Vec<u8>>, VideoEncodingError> {
+    render_scene_video_frames_png_with_keyframe_border(scene, resolution, false)
+}
+
+pub fn render_scene_video_frames_png_with_keyframe_border(
+    scene: &SceneGenerationOutput,
+    resolution: u32,
+    draw_keyframe_border: bool,
 ) -> Result<Vec<Vec<u8>>, VideoEncodingError> {
     if resolution == 0 {
         return Err(VideoEncodingError::InvalidResolution);
@@ -136,6 +146,7 @@ pub fn render_scene_video_frames_png(
                 &frame_positions,
                 &shape_colors,
                 resolution,
+                draw_keyframe_border && frame_index + 1 == frame_count,
             )?);
         }
 
@@ -151,6 +162,7 @@ fn render_frame_png(
     positions: &[(f64, f64)],
     shape_colors: &[Rgb<u8>],
     resolution: u32,
+    draw_keyframe_border: bool,
 ) -> Result<Vec<u8>, VideoEncodingError> {
     let mut canvas = RgbImage::from_pixel(resolution, resolution, Rgb([255, 255, 255]));
     draw_axes(&mut canvas);
@@ -164,6 +176,9 @@ fn render_frame_png(
             shape_colors[shape_index],
         );
     }
+    if draw_keyframe_border {
+        draw_keyframe_border_outline(&mut canvas, keyframe_border_width(resolution));
+    }
 
     let mut encoded = Vec::new();
     PngEncoder::new(&mut encoded)
@@ -175,6 +190,31 @@ fn render_frame_png(
         )
         .map_err(|error| VideoEncodingError::PngEncoding(error.to_string()))?;
     Ok(encoded)
+}
+
+fn keyframe_border_width(resolution: u32) -> u32 {
+    (resolution.saturating_mul(3) / 100).max(1)
+}
+
+fn draw_keyframe_border_outline(canvas: &mut RgbImage, border_width: u32) {
+    let width = canvas.width();
+    let height = canvas.height();
+    let layers = border_width.min(width).min(height);
+    for offset in 0..layers {
+        let left = offset;
+        let right = width - 1 - offset;
+        let top = offset;
+        let bottom = height - 1 - offset;
+
+        for x in left..=right {
+            canvas.put_pixel(x, top, KEYFRAME_BORDER_COLOR);
+            canvas.put_pixel(x, bottom, KEYFRAME_BORDER_COLOR);
+        }
+        for y in top..=bottom {
+            canvas.put_pixel(left, y, KEYFRAME_BORDER_COLOR);
+            canvas.put_pixel(right, y, KEYFRAME_BORDER_COLOR);
+        }
+    }
 }
 
 fn normalized_progress(frame_index: usize, frame_count: usize) -> f64 {
@@ -417,5 +457,90 @@ mod tests {
                 global_event_index: 7,
             }
         ));
+    }
+
+    #[test]
+    fn render_does_not_draw_keyframe_border_when_disabled() {
+        let scene = SceneGenerationOutput {
+            scene_index: 0,
+            schedule: SceneSeedSchedule::derive(1, 0),
+            shape_paths: vec![SceneShapePath {
+                shape_index: 0,
+                trajectory_points: vec![
+                    NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+                    NormalizedPoint::new(0.2, 0.2).expect("point must build"),
+                ],
+                soft_memberships: None,
+            }],
+            motion_events: vec![MotionEvent {
+                global_event_index: 0,
+                time_slot: 0,
+                shape_index: 0,
+                shape_event_index: 0,
+                start_point: NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+                end_point: NormalizedPoint::new(0.2, 0.2).expect("point must build"),
+                duration_frames: 2,
+                easing: EasingFamily::Linear,
+            }],
+            accounting: MotionEventAccounting {
+                expected_total: 1,
+                generated_total: 1,
+                expected_per_shape: vec![1],
+                generated_per_shape: vec![1],
+            },
+        };
+
+        let frames = render_scene_video_frames_png_with_keyframe_border(&scene, 64, false)
+            .expect("render should succeed");
+        assert_eq!(frames.len(), 2);
+        let keyframe = image::load_from_memory(&frames[1])
+            .expect("frame should decode")
+            .to_rgb8();
+        assert_ne!(*keyframe.get_pixel(0, 0), KEYFRAME_BORDER_COLOR);
+    }
+
+    #[test]
+    fn render_draws_keyframe_border_only_on_keyframe_frames_when_enabled() {
+        let scene = SceneGenerationOutput {
+            scene_index: 0,
+            schedule: SceneSeedSchedule::derive(1, 0),
+            shape_paths: vec![SceneShapePath {
+                shape_index: 0,
+                trajectory_points: vec![
+                    NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+                    NormalizedPoint::new(0.2, 0.2).expect("point must build"),
+                ],
+                soft_memberships: None,
+            }],
+            motion_events: vec![MotionEvent {
+                global_event_index: 0,
+                time_slot: 0,
+                shape_index: 0,
+                shape_event_index: 0,
+                start_point: NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+                end_point: NormalizedPoint::new(0.2, 0.2).expect("point must build"),
+                duration_frames: 2,
+                easing: EasingFamily::Linear,
+            }],
+            accounting: MotionEventAccounting {
+                expected_total: 1,
+                generated_total: 1,
+                expected_per_shape: vec![1],
+                generated_per_shape: vec![1],
+            },
+        };
+
+        let frames = render_scene_video_frames_png_with_keyframe_border(&scene, 64, true)
+            .expect("render should succeed");
+        assert_eq!(frames.len(), 2);
+
+        let first = image::load_from_memory(&frames[0])
+            .expect("frame should decode")
+            .to_rgb8();
+        let last = image::load_from_memory(&frames[1])
+            .expect("frame should decode")
+            .to_rgb8();
+        assert_ne!(*first.get_pixel(0, 0), KEYFRAME_BORDER_COLOR);
+        assert_eq!(*last.get_pixel(0, 0), KEYFRAME_BORDER_COLOR);
     }
 }

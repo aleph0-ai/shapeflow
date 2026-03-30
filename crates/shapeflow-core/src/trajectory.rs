@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::f64::consts::PI;
 
 const NORMALIZED_MIN: f64 = -1.0;
 const NORMALIZED_MAX: f64 = 1.0;
@@ -37,6 +38,15 @@ pub fn sample_random_linear_path_points<R: Rng>(
     segments: usize,
     samples_per_segment: usize,
 ) -> Result<Vec<NormalizedPoint>, TrajectoryError> {
+    sample_random_linear_path_points_with_complexity(rng, segments, samples_per_segment, 1)
+}
+
+pub fn sample_random_linear_path_points_with_complexity<R: Rng>(
+    rng: &mut R,
+    segments: usize,
+    samples_per_segment: usize,
+    trajectory_complexity: u8,
+) -> Result<Vec<NormalizedPoint>, TrajectoryError> {
     if segments == 0 {
         return Err(TrajectoryError::InvalidSegments { segments });
     }
@@ -47,22 +57,62 @@ pub fn sample_random_linear_path_points<R: Rng>(
     }
 
     let mut points = Vec::with_capacity(1 + segments * samples_per_segment);
+    let complexity = trajectory_complexity.clamp(1, 4);
 
     let mut current = random_point(rng)?;
     points.push(current);
 
-    for _ in 0..segments {
+    for segment_index in 0..segments {
         let next = random_point(rng)?;
-        for step in 1..=samples_per_segment {
-            let t = step as f64 / samples_per_segment as f64;
-            let x = current.x + (next.x - current.x) * t;
-            let y = current.y + (next.y - current.y) * t;
-            points.push(NormalizedPoint::new(x, y)?);
-        }
+        append_segment_samples(
+            current,
+            next,
+            samples_per_segment,
+            complexity,
+            segment_index,
+            &mut points,
+        )?;
         current = next;
     }
 
     Ok(points)
+}
+
+fn append_segment_samples(
+    start: NormalizedPoint,
+    end: NormalizedPoint,
+    samples_per_segment: usize,
+    complexity: u8,
+    segment_index: usize,
+    points: &mut Vec<NormalizedPoint>,
+) -> Result<(), TrajectoryError> {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    let (normal_x, normal_y) = if length > 0.0 {
+        (-dy / length, dx / length)
+    } else {
+        (0.0, 0.0)
+    };
+    let bend_sign = if segment_index % 2 == 0 { 1.0 } else { -1.0 };
+    let bend_scale = f64::from(complexity.saturating_sub(1)) * 0.12;
+
+    for step in 1..=samples_per_segment {
+        let t = step as f64 / samples_per_segment as f64;
+        let mut x = start.x + (end.x - start.x) * t;
+        let mut y = start.y + (end.y - start.y) * t;
+
+        if bend_scale > 0.0 && step < samples_per_segment {
+            let bend_envelope = (PI * t).sin();
+            let bend = bend_sign * bend_scale * bend_envelope;
+            x += normal_x * bend;
+            y += normal_y * bend;
+            x = x.clamp(NORMALIZED_MIN, NORMALIZED_MAX);
+            y = y.clamp(NORMALIZED_MIN, NORMALIZED_MAX);
+        }
+        points.push(NormalizedPoint::new(x, y)?);
+    }
+    Ok(())
 }
 
 fn random_point<R: Rng>(rng: &mut R) -> Result<NormalizedPoint, TrajectoryError> {
@@ -188,5 +238,45 @@ mod tests {
             assert!((min_x..=max_x).contains(&point.x));
             assert!((min_y..=max_y).contains(&point.y));
         }
+    }
+
+    #[test]
+    fn complexity_changes_internal_waypoint_geometry() {
+        let mut low_rng = ChaCha8Rng::seed_from_u64(4242);
+        let mut high_rng = ChaCha8Rng::seed_from_u64(4242);
+
+        let segments = 3;
+        let samples_per_segment = 12;
+        let low = sample_random_linear_path_points_with_complexity(
+            &mut low_rng,
+            segments,
+            samples_per_segment,
+            1,
+        )
+        .expect("sampling should succeed");
+        let high = sample_random_linear_path_points_with_complexity(
+            &mut high_rng,
+            segments,
+            samples_per_segment,
+            4,
+        )
+        .expect("sampling should succeed");
+
+        assert_eq!(low.len(), high.len());
+        for boundary in 0..=segments {
+            let idx = boundary * samples_per_segment;
+            assert_point_near(low[idx], high[idx]);
+        }
+
+        let changed_internal_point = (1..low.len() - 1).any(|idx| {
+            if idx % samples_per_segment == 0 {
+                return false;
+            }
+            (low[idx].x - high[idx].x).abs() > 1e-9 || (low[idx].y - high[idx].y).abs() > 1e-9
+        });
+        assert!(
+            changed_internal_point,
+            "higher trajectory complexity should perturb internal samples"
+        );
     }
 }

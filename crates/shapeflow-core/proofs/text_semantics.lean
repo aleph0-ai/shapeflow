@@ -36,6 +36,7 @@ structure EventSem where
 
 structure PairSem where
   pairIndex : Nat
+  eventIndex : Nat
   firstShapeId : String
   secondShapeId : String
   horizontalRel : HorizontalRel
@@ -61,11 +62,12 @@ structure EventSurface where
   deriving DecidableEq, Repr
 
 structure PairSurface where
+  eventIndex : Nat
   subject : String
   object : String
   horizontalRel : HorizontalRel
   verticalRel : VerticalRel
-  swapped : Bool
+  syntaxTag : Nat
   pairIndex : Nat
   deriving DecidableEq, Repr
 
@@ -74,16 +76,6 @@ structure SceneSurface where
   events : List EventSurface
   pairs : List PairSurface
   deriving DecidableEq, Repr
-
-def flipHorizontal : HorizontalRel → HorizontalRel
-  | .leftOf => .rightOf
-  | .rightOf => .leftOf
-  | .alignedHorizontally => .alignedHorizontally
-
-def flipVertical : VerticalRel → VerticalRel
-  | .above => .below
-  | .below => .above
-  | .alignedVertically => .alignedVertically
 
 def alterEvent (profile : AlterationProfile) (event : EventSem) : EventSurface :=
   match profile with
@@ -102,39 +94,33 @@ def alterPair (profile : AlterationProfile) (pair : PairSem) : PairSurface :=
       {
         subject := pair.firstShapeId
         object := pair.secondShapeId
+        eventIndex := pair.eventIndex
         horizontalRel := pair.horizontalRel
         verticalRel := pair.verticalRel
-        swapped := false
+        syntaxTag := 0
         pairIndex := pair.pairIndex
       }
   | .pairClauseReordered
   | .fullyReordered =>
       {
-        subject := pair.secondShapeId
-        object := pair.firstShapeId
-        horizontalRel := flipHorizontal pair.horizontalRel
-        verticalRel := flipVertical pair.verticalRel
-        swapped := true
+        subject := pair.firstShapeId
+        object := pair.secondShapeId
+        eventIndex := pair.eventIndex
+        horizontalRel := pair.horizontalRel
+        verticalRel := pair.verticalRel
+        syntaxTag := 1
         pairIndex := pair.pairIndex
       }
 
 def decodePair (surface : PairSurface) : PairSem :=
-  if surface.swapped then
-    {
-      pairIndex := surface.pairIndex
-      firstShapeId := surface.object
-      secondShapeId := surface.subject
-      horizontalRel := flipHorizontal surface.horizontalRel
-      verticalRel := flipVertical surface.verticalRel
-    }
-  else
-    {
-      pairIndex := surface.pairIndex
-      firstShapeId := surface.subject
-      secondShapeId := surface.object
-      horizontalRel := surface.horizontalRel
-      verticalRel := surface.verticalRel
-    }
+  {
+    pairIndex := surface.pairIndex
+    eventIndex := surface.eventIndex
+    firstShapeId := surface.subject
+    secondShapeId := surface.object
+    horizontalRel := surface.horizontalRel
+    verticalRel := surface.verticalRel
+  }
 
 def alterScene (profile : AlterationProfile) (scene : SceneSem) : SceneSurface :=
   {
@@ -150,14 +136,6 @@ def decodeScene (surface : SceneSurface) : SceneSem :=
     pairs := surface.pairs.map decodePair
   }
 
-theorem flipHorizontal_involutive (rel : HorizontalRel) :
-    flipHorizontal (flipHorizontal rel) = rel := by
-  cases rel <;> rfl
-
-theorem flipVertical_involutive (rel : VerticalRel) :
-    flipVertical (flipVertical rel) = rel := by
-  cases rel <;> rfl
-
 theorem decode_alterEvent_eq (profile : AlterationProfile) (event : EventSem) :
     decodeEvent (alterEvent profile event) = event := by
   cases profile <;> rfl
@@ -165,8 +143,8 @@ theorem decode_alterEvent_eq (profile : AlterationProfile) (event : EventSem) :
 theorem decode_alterPair_eq (profile : AlterationProfile) (pair : PairSem) :
     decodePair (alterPair profile pair) = pair := by
   cases pair with
-  | mk pairIndex firstShapeId secondShapeId horizontalRel verticalRel =>
-      cases profile <;> cases horizontalRel <;> cases verticalRel <;> rfl
+  | mk pairIndex eventIndex firstShapeId secondShapeId horizontalRel verticalRel =>
+      cases profile <;> rfl
 
 theorem decode_alterScene_eq (profile : AlterationProfile) (scene : SceneSem) :
     decodeScene (alterScene profile scene) = scene := by

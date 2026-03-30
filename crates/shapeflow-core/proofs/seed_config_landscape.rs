@@ -16,6 +16,7 @@ verus! {
 pub const TRAJECTORY_OFFSET: u64 = 1_000_000;
 pub const TEXT_GRAMMAR_OFFSET: u64 = 2_000_000;
 pub const LEXICAL_NOISE_OFFSET: u64 = 3_000_000;
+pub const U64_MAX_VALUE: u64 = 18_446_744_073_709_551_615;
 
 pub proof fn seed_offset_constants_are_distinct()
     ensures
@@ -74,6 +75,8 @@ pub proof fn seed_schedule_streams_are_pairwise_distinct(
     master_seed: nat,
     scene_index: nat,
 )
+    requires
+        master_seed + scene_index + (LEXICAL_NOISE_OFFSET as nat) <= (U64_MAX_VALUE as nat),
     ensures
         seed_schedule_model(master_seed, scene_index).0
             != seed_schedule_model(master_seed, scene_index).1,
@@ -118,8 +121,8 @@ pub struct ConfigModel {
     pub scene: nat,
     pub positional_landscape: nat,
     pub site_graph: nat,
-    pub split: nat,
     pub parallelism: nat,
+    pub generation_profile: nat,
 }
 
 pub open spec fn canonical_hash_payload(
@@ -129,8 +132,8 @@ pub open spec fn canonical_hash_payload(
         cfg.scene,
         cfg.positional_landscape,
         cfg.site_graph,
-        cfg.split,
         cfg.parallelism,
+        cfg.generation_profile,
     )
 }
 
@@ -141,8 +144,8 @@ pub proof fn config_hash_input_excludes_master_seed(
     scene: nat,
     positional_landscape: nat,
     site_graph: nat,
-    split: nat,
     parallelism: nat,
+    generation_profile: nat,
 )
     ensures
         canonical_hash_payload(ConfigModel {
@@ -151,16 +154,16 @@ pub proof fn config_hash_input_excludes_master_seed(
             scene,
             positional_landscape,
             site_graph,
-            split,
             parallelism,
+            generation_profile,
         }) == canonical_hash_payload(ConfigModel {
             schema_version,
             master_seed: master_seed_b,
             scene,
             positional_landscape,
             site_graph,
-            split,
             parallelism,
+            generation_profile,
         }),
 {
 }
@@ -172,8 +175,8 @@ pub proof fn config_hash_input_excludes_schema_version(
     scene: nat,
     positional_landscape: nat,
     site_graph: nat,
-    split: nat,
     parallelism: nat,
+    generation_profile: nat,
 )
     ensures
         canonical_hash_payload(ConfigModel {
@@ -182,16 +185,16 @@ pub proof fn config_hash_input_excludes_schema_version(
             scene,
             positional_landscape,
             site_graph,
-            split,
             parallelism,
+            generation_profile,
         }) == canonical_hash_payload(ConfigModel {
             schema_version: schema_version_b,
             master_seed,
             scene,
             positional_landscape,
             site_graph,
-            split,
             parallelism,
+            generation_profile,
         }),
 {
 }
@@ -203,8 +206,8 @@ pub proof fn config_hash_payload_sensitive_to_scene(
     scene_b: nat,
     positional_landscape: nat,
     site_graph: nat,
-    split: nat,
     parallelism: nat,
+    generation_profile: nat,
 )
     requires
         scene_a != scene_b,
@@ -215,16 +218,16 @@ pub proof fn config_hash_payload_sensitive_to_scene(
             scene: scene_a,
             positional_landscape,
             site_graph,
-            split,
             parallelism,
+            generation_profile,
         }) != canonical_hash_payload(ConfigModel {
             schema_version,
             master_seed,
             scene: scene_b,
             positional_landscape,
             site_graph,
-            split,
             parallelism,
+            generation_profile,
         }),
 {
 }
@@ -236,8 +239,8 @@ pub proof fn config_hash_payload_sensitive_to_positional_landscape(
     positional_landscape_a: nat,
     positional_landscape_b: nat,
     site_graph: nat,
-    split: nat,
     parallelism: nat,
+    generation_profile: nat,
 )
     requires
         positional_landscape_a != positional_landscape_b,
@@ -248,16 +251,16 @@ pub proof fn config_hash_payload_sensitive_to_positional_landscape(
             scene,
             positional_landscape: positional_landscape_a,
             site_graph,
-            split,
             parallelism,
+            generation_profile,
         }) != canonical_hash_payload(ConfigModel {
             schema_version,
             master_seed,
             scene,
             positional_landscape: positional_landscape_b,
             site_graph,
-            split,
             parallelism,
+            generation_profile,
         }),
 {
 }
@@ -269,8 +272,8 @@ pub proof fn config_hash_payload_sensitive_to_site_graph(
     positional_landscape: nat,
     site_graph_a: nat,
     site_graph_b: nat,
-    split: nat,
     parallelism: nat,
+    generation_profile: nat,
 )
     requires
         site_graph_a != site_graph_b,
@@ -281,49 +284,16 @@ pub proof fn config_hash_payload_sensitive_to_site_graph(
             scene,
             positional_landscape,
             site_graph: site_graph_a,
-            split,
             parallelism,
+            generation_profile,
         }) != canonical_hash_payload(ConfigModel {
             schema_version,
             master_seed,
             scene,
             positional_landscape,
             site_graph: site_graph_b,
-            split,
             parallelism,
-        }),
-{
-}
-
-pub proof fn config_hash_payload_sensitive_to_split(
-    schema_version: nat,
-    master_seed: nat,
-    scene: nat,
-    positional_landscape: nat,
-    site_graph: nat,
-    split_a: nat,
-    split_b: nat,
-    parallelism: nat,
-)
-    requires
-        split_a != split_b,
-    ensures
-        canonical_hash_payload(ConfigModel {
-            schema_version,
-            master_seed,
-            scene,
-            positional_landscape,
-            site_graph,
-            split: split_a,
-            parallelism,
-        }) != canonical_hash_payload(ConfigModel {
-            schema_version,
-            master_seed,
-            scene,
-            positional_landscape,
-            site_graph,
-            split: split_b,
-            parallelism,
+            generation_profile,
         }),
 {
 }
@@ -334,9 +304,9 @@ pub proof fn config_hash_payload_sensitive_to_parallelism(
     scene: nat,
     positional_landscape: nat,
     site_graph: nat,
-    split: nat,
     parallelism_a: nat,
     parallelism_b: nat,
+    generation_profile: nat,
 )
     requires
         parallelism_a != parallelism_b,
@@ -347,17 +317,49 @@ pub proof fn config_hash_payload_sensitive_to_parallelism(
             scene,
             positional_landscape,
             site_graph,
-            split,
             parallelism: parallelism_a,
+            generation_profile,
         }) != canonical_hash_payload(ConfigModel {
             schema_version,
             master_seed,
             scene,
             positional_landscape,
             site_graph,
-            split,
             parallelism: parallelism_b,
+            generation_profile,
         }),
+{
+}
+
+pub proof fn config_hash_payload_sensitive_to_generation_profile(
+    schema_version: nat,
+    master_seed: nat,
+    scene_a: nat,
+    positional_landscape_a: nat,
+    site_graph_a: nat,
+    parallelism_a: nat,
+    generation_profile_a: nat,
+    generation_profile_b: nat,
+)
+    requires
+        generation_profile_a != generation_profile_b,
+    ensures canonical_hash_payload(ConfigModel {
+        schema_version,
+        master_seed,
+        scene: scene_a,
+        positional_landscape: positional_landscape_a,
+        site_graph: site_graph_a,
+        parallelism: parallelism_a,
+        generation_profile: generation_profile_a,
+    }) != canonical_hash_payload(ConfigModel {
+        schema_version,
+        master_seed,
+        scene: scene_a,
+        positional_landscape: positional_landscape_a,
+        site_graph: site_graph_a,
+        parallelism: parallelism_a,
+        generation_profile: generation_profile_b,
+    }),
 {
 }
 

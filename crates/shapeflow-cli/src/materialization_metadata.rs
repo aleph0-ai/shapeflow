@@ -5,8 +5,9 @@ use shapeflow_core::{
     LatentArtifact, SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig,
     canonical_scene_id, deserialize_latent_artifact, deserialize_target_artifact,
     extract_latent_vector_from_scene, generate_ordered_quadrant_passage_targets, generate_scene,
-    generate_scene_text_lines, generate_tabular_motion_rows, render_scene_image_png,
-    render_scene_sound_wav, render_scene_video_frames_png, serialize_latent_artifact,
+    generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
+    render_scene_image_png_with_scene_config, render_scene_sound_wav,
+    render_scene_video_frames_png_with_keyframe_border, serialize_latent_artifact,
     serialize_scene_text, serialize_tabular_motion_rows_csv,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,12 +84,18 @@ pub(crate) fn validate_generated_materialization_metadata(
         samples_per_event
     );
 
+    let effective_scene_configs = vec![config.clone(); scene_count as usize];
+
     let expected_scene_count = scene_count as usize;
-    let expected_target_file_count = expected_scene_count * usize::from(config.scene.n_shapes);
-    let expected_video_frame_file_count_per_scene = expected_video_frames_per_scene(config)
-        .context("failed to derive expected video-frame count per scene")?;
-    let expected_video_frame_file_count =
-        expected_scene_count * expected_video_frame_file_count_per_scene;
+    let expected_target_file_count: usize = effective_scene_configs
+        .iter()
+        .map(|effective_config| usize::from(effective_config.scene.n_shapes))
+        .sum();
+    let expected_video_frames_per_scene = effective_scene_configs
+        .iter()
+        .map(expected_video_frames_per_scene)
+        .collect::<Result<Vec<_>>>()?;
+    let expected_video_frame_file_count: usize = expected_video_frames_per_scene.iter().sum();
 
     ensure!(
         metadata.target_file_count == expected_target_file_count,
@@ -171,14 +178,23 @@ pub(crate) fn validate_generated_materialization_metadata(
     let observed_video_frame_file_count = validate_video_frame_file_sets(
         &video_frames_dir,
         &scene_ids,
-        expected_video_frame_file_count_per_scene,
+        &expected_video_frames_per_scene,
     )?;
 
     let targets_dir = output_root.join("targets");
-    let (observed_target_file_count, observed_target_segment_count) =
-        validate_target_artifacts(&targets_dir, config, &scene_ids, samples_per_event)?;
-    validate_non_target_artifact_payloads(output_root, config, &scene_ids, samples_per_event)
-        .context("generated non-target artifact payload validation failed")?;
+    let (observed_target_file_count, observed_target_segment_count) = validate_target_artifacts(
+        &targets_dir,
+        &effective_scene_configs,
+        &scene_ids,
+        samples_per_event,
+    )?;
+    validate_non_target_artifact_payloads(
+        output_root,
+        &effective_scene_configs,
+        &scene_ids,
+        samples_per_event,
+    )
+    .context("generated non-target artifact payload validation failed")?;
 
     ensure!(
         metadata.target_file_count == observed_target_file_count,
@@ -265,10 +281,15 @@ fn expected_artifact_filenames(scene_ids: &[String], extension: &str) -> BTreeSe
         .collect()
 }
 
-fn expected_target_filenames(scene_ids: &[String], n_shapes: usize) -> BTreeSet<String> {
+fn expected_target_filenames(
+    scene_ids: &[String],
+    effective_scene_configs: &[ShapeFlowConfig],
+) -> BTreeSet<String> {
     scene_ids
         .iter()
-        .flat_map(|scene_id| {
+        .enumerate()
+        .flat_map(|(scene_index, scene_id)| {
+            let n_shapes = usize::from(effective_scene_configs[scene_index].scene.n_shapes);
             (0..n_shapes).map(move |shape_index| {
                 let task_id = format!("oqp{:04}", shape_index);
                 format!("{scene_id}_{task_id}.sft")
@@ -330,7 +351,7 @@ fn ensure_exact_file_set(
 fn validate_video_frame_file_sets(
     video_frames_dir: &Utf8Path,
     scene_ids: &[String],
-    expected_frames_per_scene: usize,
+    expected_frames_per_scene: &[usize],
 ) -> Result<usize> {
     let expected_scene_dirs: BTreeSet<String> = scene_ids.iter().cloned().collect();
     let observed_scene_dirs = ensure_exact_file_set(
@@ -338,10 +359,11 @@ fn validate_video_frame_file_sets(
         &expected_scene_dirs,
         "video_frames scene directories",
     )?;
-    let expected_frame_files = expected_video_frame_filenames(expected_frames_per_scene);
     let mut observed_frame_file_count = 0usize;
 
-    for scene_id in scene_ids {
+    for (scene_index, scene_id) in scene_ids.iter().enumerate() {
+        let expected_frame_files =
+            expected_video_frame_filenames(expected_frames_per_scene[scene_index]);
         let scene_dir = video_frames_dir.join(scene_id);
         let observed_scene_frames = ensure_exact_file_set(
             &scene_dir,
@@ -361,12 +383,11 @@ fn validate_video_frame_file_sets(
 
 fn validate_target_artifacts(
     targets_dir: &Utf8Path,
-    config: &ShapeFlowConfig,
+    effective_scene_configs: &[ShapeFlowConfig],
     scene_ids: &[String],
     samples_per_event: usize,
 ) -> Result<(usize, usize)> {
-    let expected_shape_count = usize::from(config.scene.n_shapes);
-    let expected_target_filenames = expected_target_filenames(scene_ids, expected_shape_count);
+    let expected_target_filenames = expected_target_filenames(scene_ids, effective_scene_configs);
     let observed_target_files =
         ensure_exact_file_set(targets_dir, &expected_target_filenames, "target artifacts")?;
 
@@ -374,8 +395,10 @@ fn validate_target_artifacts(
     let mut observed_target_segment_count = 0usize;
 
     for (scene_index, scene_id) in scene_ids.iter().enumerate() {
+        let effective_config = &effective_scene_configs[scene_index];
+        let expected_shape_count = usize::from(effective_config.scene.n_shapes);
         let params = SceneGenerationParams {
-            config,
+            config: effective_config,
             scene_index: u64::try_from(scene_index).with_context(|| {
                 format!(
                     "failed to convert scene index to u64 for target payload validation: scene_index={scene_index}"
@@ -466,13 +489,14 @@ fn validate_target_artifacts(
 
 fn validate_non_target_artifact_payloads(
     output_root: &Utf8Path,
-    config: &ShapeFlowConfig,
+    effective_scene_configs: &[ShapeFlowConfig],
     scene_ids: &[String],
     samples_per_event: usize,
 ) -> Result<()> {
     for (scene_index, scene_id) in scene_ids.iter().enumerate() {
+        let effective_config = &effective_scene_configs[scene_index];
         let params = SceneGenerationParams {
-            config,
+            config: effective_config,
             scene_index: u64::try_from(scene_index).with_context(|| {
                 format!(
                     "failed to convert scene index to u64 for generated artifact payload validation: scene_index={scene_index}"
@@ -488,7 +512,7 @@ fn validate_non_target_artifact_payloads(
         })?;
 
         let expected_latent_artifact = LatentArtifact {
-            schema_version: config.schema_version,
+            schema_version: effective_config.schema_version,
             scene_id: scene_id.clone(),
             values: extract_latent_vector_from_scene(&output).with_context(|| {
                 format!(
@@ -542,11 +566,13 @@ fn validate_non_target_artifact_payloads(
             "generated tabular artifact payload validation failed for scene_id={scene_id}: csv payload mismatch"
         );
 
-        let expected_text_lines = generate_scene_text_lines(&output).with_context(|| {
-            format!(
-                "failed to generate expected text lines for generated artifact payload validation: scene_id={scene_id}"
-            )
-        })?;
+        let expected_text_lines =
+            generate_scene_text_lines_with_scene_config(&output, &effective_config.scene)
+                .with_context(|| {
+                    format!(
+                        "failed to generate expected text lines for generated artifact payload validation: scene_id={scene_id}"
+                    )
+                })?;
         let expected_text_body = serialize_scene_text(&expected_text_lines);
         let text_path = output_root.join("text").join(format!("{scene_id}.txt"));
         let observed_text_body =
@@ -561,7 +587,8 @@ fn validate_non_target_artifact_payloads(
         );
 
         let expected_image_png =
-            render_scene_image_png(&output, config.scene.resolution).with_context(|| {
+            render_scene_image_png_with_scene_config(&output, &effective_config.scene)
+                .with_context(|| {
                 format!(
                     "failed to render expected image artifact for generated artifact payload validation: scene_id={scene_id}"
                 )
@@ -579,10 +606,10 @@ fn validate_non_target_artifact_payloads(
 
         let expected_sound_wav = render_scene_sound_wav(
             &output,
-            config.scene.sound_sample_rate_hz,
-            config.scene.sound_frames_per_second,
-            config.scene.sound_modulation_depth_per_mille,
-            config.scene.sound_channel_mapping,
+            effective_config.scene.sound_sample_rate_hz,
+            effective_config.scene.sound_frames_per_second,
+            effective_config.scene.sound_modulation_depth_per_mille,
+            effective_config.scene.sound_channel_mapping,
         )
         .with_context(|| {
             format!(
@@ -600,12 +627,16 @@ fn validate_non_target_artifact_payloads(
             "generated sound artifact payload validation failed for scene_id={scene_id}: wav payload mismatch"
         );
 
-        let expected_video_frames =
-            render_scene_video_frames_png(&output, config.scene.resolution).with_context(|| {
-                format!(
-                    "failed to render expected video frames for generated artifact payload validation: scene_id={scene_id}"
-                )
-            })?;
+        let expected_video_frames = render_scene_video_frames_png_with_keyframe_border(
+            &output,
+            effective_config.scene.resolution,
+            effective_config.scene.video_keyframe_border,
+        )
+        .with_context(|| {
+            format!(
+                "failed to render expected video frames for generated artifact payload validation: scene_id={scene_id}"
+            )
+        })?;
         let video_frame_dir = output_root.join("video_frames").join(scene_id);
         for (frame_index, expected_frame_png) in expected_video_frames.iter().enumerate() {
             let frame_path = video_frame_dir.join(format!("frame_{frame_index:06}.png"));

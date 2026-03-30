@@ -79,7 +79,6 @@ pub(crate) fn run_export_split(
         master_seed: split_assignments.master_seed,
         config_hash: split_assignments.config_hash,
         schema_version: split_assignments.schema_version,
-        split_policy: split_assignments.split_policy,
         summary: summarize_assignments(&selected_assignments),
         assignments: selected_assignments.clone(),
     };

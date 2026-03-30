@@ -1,7 +1,9 @@
+use crate::config::SceneConfig;
 use crate::scene_generation::SceneGenerationOutput;
 use crate::text_semantics::{
     TextAlterationProfile, TextSemanticsError, decode_scene_text_semantics,
     generate_scene_text_lines_with_alteration,
+    generate_scene_text_lines_with_scene_config as generate_scene_text_lines_with_scene_config_semantics,
 };
 
 pub use crate::text_semantics::TextSemanticsError as TextEncodingError;
@@ -17,6 +19,13 @@ pub fn generate_scene_text_lines_with_profile(
     profile: TextAlterationProfile,
 ) -> Result<Vec<String>, TextEncodingError> {
     generate_scene_text_lines_with_alteration(scene, profile)
+}
+
+pub fn generate_scene_text_lines_with_scene_config(
+    scene: &SceneGenerationOutput,
+    scene_cfg: &SceneConfig,
+) -> Result<Vec<String>, TextEncodingError> {
+    generate_scene_text_lines_with_scene_config_semantics(scene, scene_cfg)
 }
 
 pub fn assert_text_lines_match_semantics(
@@ -47,6 +56,7 @@ pub fn serialize_scene_text(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TextReferenceFrame;
     use crate::scene_generation::{
         MotionEvent, MotionEventAccounting, SceneGenerationParams, SceneProjectionMode,
         SceneShapePath, generate_scene,
@@ -185,46 +195,60 @@ mod tests {
 
                 let pair_lines_start = 1 + scene.motion_events.len();
                 let mut expected_pair_index = 0usize;
-                for i in 0..shape_count {
-                    for j in (i + 1)..shape_count {
-                        let expected_pair_marker = format!("Pair {:04}:", expected_pair_index);
-                        let expected_pair_line = &lines[pair_lines_start + expected_pair_index];
-                        assert!(
-                            expected_pair_line.starts_with(&expected_pair_marker),
-                            "pair index mismatch at line for pair ({i}, {j}); expected marker {expected_pair_marker}"
-                        );
+                for event in &scene.motion_events {
+                    for i in 0..shape_count {
+                        for j in (i + 1)..shape_count {
+                            let expected_pair_marker = format!("Pair {:04}:", expected_pair_index);
+                            let expected_event_marker =
+                                format!("[event {:04}] ", event.global_event_index);
+                            let expected_pair_line = &lines[pair_lines_start + expected_pair_index];
+                            assert!(
+                                expected_pair_line.starts_with(&expected_pair_marker),
+                                "pair index mismatch at line for event {} pair ({i}, {j}); expected marker {expected_pair_marker}",
+                                event.global_event_index
+                            );
+                            assert!(
+                                expected_pair_line.contains(&expected_event_marker),
+                                "missing event marker {expected_event_marker} for pair ({i}, {j})"
+                            );
 
-                        let first_id = &identities[i];
-                        let second_id = &identities[j];
-                        assert!(
-                            expected_pair_line.contains(first_id),
-                            "missing first shape id {first_id} for pair ({i}, {j})"
-                        );
-                        assert!(
-                            expected_pair_line.contains(second_id),
-                            "missing second shape id {second_id} for pair ({i}, {j})"
-                        );
-                        let first_position = expected_pair_line
-                            .find(first_id)
-                            .expect("generated pair line should include first shape id");
-                        let second_position = expected_pair_line
-                            .find(second_id)
-                            .expect("generated pair line should include second shape id");
-                        assert!(
-                            first_position < second_position,
-                            "pair line ordering changed for ({i}, {j})"
-                        );
+                            let first_id = &identities[i];
+                            let second_id = &identities[j];
+                            assert!(
+                                expected_pair_line.contains(first_id),
+                                "missing first shape id {first_id} for event {} pair ({i}, {j})",
+                                event.global_event_index
+                            );
+                            assert!(
+                                expected_pair_line.contains(second_id),
+                                "missing second shape id {second_id} for event {} pair ({i}, {j})",
+                                event.global_event_index
+                            );
+                            let first_position = expected_pair_line
+                                .find(first_id)
+                                .expect("generated pair line should include first shape id");
+                            let second_position = expected_pair_line
+                                .find(second_id)
+                                .expect("generated pair line should include second shape id");
+                            assert!(
+                                first_position < second_position,
+                                "pair line ordering changed for event {} pair ({i}, {j})",
+                                event.global_event_index
+                            );
 
-                        assert!(
-                            lines.iter().any(|line| {
-                                line.starts_with("Pair ")
-                                    && line.contains(first_id)
-                                    && line.contains(second_id)
-                            }),
-                            "missing pair sentence for {first_id} and {second_id}"
-                        );
+                            assert!(
+                                lines.iter().any(|line| {
+                                    line.starts_with("Pair ")
+                                        && line.contains(&expected_event_marker)
+                                        && line.contains(first_id)
+                                        && line.contains(second_id)
+                                }),
+                                "missing pair sentence for event {} ({first_id}, {second_id})",
+                                event.global_event_index
+                            );
 
-                        expected_pair_index += 1;
+                            expected_pair_index += 1;
+                        }
                     }
                 }
                 assert_eq!(expected_pair_index, expected_pair_lines);
@@ -267,6 +291,117 @@ mod tests {
             canonical, reordered,
             "canonical and reordered surfaces should differ"
         );
+    }
+
+    #[test]
+    fn generation_with_non_default_text_config_is_deterministic() {
+        let mut config = bootstrap_config();
+        config.scene.text_reference_frame = TextReferenceFrame::Mixed;
+        config.scene.text_synonym_rate = 0.4;
+        config.scene.text_typo_rate = 0.12;
+
+        let params = SceneGenerationParams {
+            config: &config,
+            scene_index: 5,
+            samples_per_event: 16,
+            projection: SceneProjectionMode::TrajectoryOnly,
+        };
+        let scene = generate_scene(&params).expect("scene generation should succeed");
+
+        let first = generate_scene_text_lines_with_scene_config(&scene, &config.scene)
+            .expect("scene text should generate");
+        let second = generate_scene_text_lines_with_scene_config(&scene, &config.scene)
+            .expect("scene text should generate");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn generation_with_non_default_text_config_decodes_to_same_semantics() {
+        let mut config = bootstrap_config();
+        config.scene.text_reference_frame = TextReferenceFrame::Relative;
+        config.scene.text_synonym_rate = 0.3;
+        config.scene.text_typo_rate = 0.25;
+
+        let params = SceneGenerationParams {
+            config: &config,
+            scene_index: 4,
+            samples_per_event: 10,
+            projection: SceneProjectionMode::TrajectoryOnly,
+        };
+        let scene = generate_scene(&params).expect("scene generation should succeed");
+
+        let canonical =
+            generate_scene_text_lines(&scene).expect("canonical generation should succeed");
+        let expected =
+            decode_scene_text_semantics(&canonical).expect("canonical decode should work");
+        let varied = generate_scene_text_lines_with_scene_config(&scene, &config.scene)
+            .expect("configured generation should succeed");
+        let decoded = decode_scene_text_semantics(&varied).expect("configured decode should work");
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn generation_with_non_default_text_config_preserves_line_count_and_order() {
+        let mut config = bootstrap_config();
+        config.scene.text_reference_frame = TextReferenceFrame::Mixed;
+        config.scene.text_synonym_rate = 0.5;
+        config.scene.text_typo_rate = 0.0;
+
+        let params = SceneGenerationParams {
+            config: &config,
+            scene_index: 2,
+            samples_per_event: 12,
+            projection: SceneProjectionMode::TrajectoryOnly,
+        };
+        let scene = generate_scene(&params).expect("scene generation should succeed");
+        let lines = generate_scene_text_lines_with_scene_config(&scene, &config.scene)
+            .expect("scene text should generate");
+        let semantics =
+            derive_scene_text_semantics(&scene).expect("semantic derivation should work");
+
+        assert_eq!(
+            lines.len(),
+            1 + semantics.events.len() + semantics.pairs.len()
+        );
+
+        for (offset, event) in semantics.events.iter().enumerate() {
+            let marker = format!("Event {:04}:", event.event_index);
+            assert!(
+                lines[1 + offset].contains(&marker),
+                "event line {} lost marker {}",
+                event.event_index,
+                marker
+            );
+        }
+
+        let pair_start = 1 + semantics.events.len();
+        for (offset, pair) in semantics.pairs.iter().enumerate() {
+            let marker = format!("Pair {:04}:", pair.pair_index);
+            assert!(
+                lines[pair_start + offset].contains(&marker),
+                "pair line {} lost marker {}",
+                pair.pair_index,
+                marker
+            );
+            assert!(
+                lines[pair_start + offset].contains(&pair.event_index.to_string()),
+                "pair line {} missing event marker for event {}",
+                pair.pair_index,
+                pair.event_index
+            );
+            assert!(
+                lines[pair_start + offset].contains(&pair.first_shape_id),
+                "pair line {} missing first shape id {}",
+                pair.pair_index,
+                pair.first_shape_id
+            );
+            assert!(
+                lines[pair_start + offset].contains(&pair.second_shape_id),
+                "pair line {} missing second shape id {}",
+                pair.pair_index,
+                pair.second_shape_id
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use crate::config::{ConfigError, EasingFamily, SceneConfig, ShapeFlowConfig};
 use crate::landscape::{LandscapeError, SoftQuadrantMembership, positional_identity};
 use crate::seed_schedule::SceneSeedSchedule;
-use crate::trajectory::{NormalizedPoint, TrajectoryError, sample_random_linear_path_points};
+use crate::trajectory::{
+    NormalizedPoint, TrajectoryError, sample_random_linear_path_points_with_complexity,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneProjectionMode {
@@ -113,10 +115,11 @@ pub fn generate_scene(
         .copied()
         .enumerate()
     {
-        let trajectory_points = sample_random_linear_path_points(
+        let trajectory_points = sample_random_linear_path_points_with_complexity(
             &mut trajectory_rng,
             usize::from(event_count),
             params.samples_per_event,
+            params.config.scene.trajectory_complexity,
         )?;
         let soft_memberships = match params.projection {
             SceneProjectionMode::TrajectoryOnly => None,
@@ -323,6 +326,7 @@ mod tests {
         ShapeFlowConfig {
             schema_version: 1,
             master_seed: 1234,
+            generation_profile: None,
             scene: crate::config::SceneConfig {
                 resolution: 512,
                 n_shapes: 2,
@@ -336,6 +340,12 @@ mod tests {
                 sound_frames_per_second: 24,
                 sound_modulation_depth_per_mille: 250,
                 sound_channel_mapping: crate::config::SoundChannelMapping::StereoAlternating,
+                text_reference_frame: crate::config::TextReferenceFrame::Canonical,
+                text_synonym_rate: 0.0,
+                text_typo_rate: 0.0,
+                video_keyframe_border: false,
+                image_frame_scatter: false,
+                image_arrow_type: crate::config::ImageArrowType::Next,
             },
             positional_landscape: crate::config::PositionalLandscapeConfig {
                 x_nonlinearity: crate::config::AxisNonlinearityFamily::Sigmoid,
@@ -348,9 +358,6 @@ mod tests {
                 lambda2_min: 0.05,
                 validation_scene_count: 32,
                 lambda2_iterations: 64,
-            },
-            split: crate::config::SplitConfig {
-                policy: crate::config::SplitPolicyConfig::Standard,
             },
             parallelism: crate::config::ParallelismConfig { num_threads: 4 },
         }
@@ -598,5 +605,72 @@ mod tests {
                 value: -1.0
             })
         ));
+    }
+
+    #[test]
+    fn varying_trajectory_complexity_changes_path_geometry_without_altering_event_accounting() {
+        let mut cfg_low = sample_config();
+        cfg_low.scene.trajectory_complexity = 1;
+        let mut cfg_high = sample_config();
+        cfg_high.scene.trajectory_complexity = 4;
+
+        let low = generate_scene(&SceneGenerationParams {
+            config: &cfg_low,
+            scene_index: 29,
+            samples_per_event: 8,
+            projection: SceneProjectionMode::TrajectoryOnly,
+        })
+        .expect("scene generation should succeed");
+        let high = generate_scene(&SceneGenerationParams {
+            config: &cfg_high,
+            scene_index: 29,
+            samples_per_event: 8,
+            projection: SceneProjectionMode::TrajectoryOnly,
+        })
+        .expect("scene generation should succeed");
+
+        assert_eq!(low.accounting, high.accounting);
+        assert_eq!(low.motion_events, high.motion_events);
+        assert_eq!(low.shape_paths.len(), high.shape_paths.len());
+
+        let samples_per_event = 8usize;
+        for (low_path, high_path) in low.shape_paths.iter().zip(high.shape_paths.iter()) {
+            assert_eq!(low_path.shape_index, high_path.shape_index);
+            assert_eq!(
+                low_path.trajectory_points.len(),
+                high_path.trajectory_points.len()
+            );
+            let boundary_count =
+                usize::from(low.accounting.expected_per_shape[low_path.shape_index]);
+            for boundary in 0..=boundary_count {
+                let idx = boundary * samples_per_event;
+                let low_point = low_path.trajectory_points[idx];
+                let high_point = high_path.trajectory_points[idx];
+                assert!((low_point.x - high_point.x).abs() <= 1e-9);
+                assert!((low_point.y - high_point.y).abs() <= 1e-9);
+            }
+        }
+
+        let changed_internal_point = low
+            .shape_paths
+            .iter()
+            .zip(high.shape_paths.iter())
+            .flat_map(|(low_path, high_path)| {
+                low_path
+                    .trajectory_points
+                    .iter()
+                    .zip(high_path.trajectory_points.iter())
+                    .enumerate()
+                    .filter(|(idx, _)| idx % samples_per_event != 0)
+                    .map(|(_, (low_point, high_point))| {
+                        (low_point.x - high_point.x).abs() > 1e-9
+                            || (low_point.y - high_point.y).abs() > 1e-9
+                    })
+            })
+            .any(|changed| changed);
+        assert!(
+            changed_internal_point,
+            "trajectory complexity should change at least one non-boundary sampled point"
+        );
     }
 }

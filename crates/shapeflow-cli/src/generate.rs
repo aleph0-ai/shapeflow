@@ -9,8 +9,9 @@ use shapeflow_core::{
     LatentArtifact, SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig, TargetArtifact,
     build_split_assignments, canonical_scene_id, deserialize_latent_artifact,
     extract_latent_vector_from_scene, generate_ordered_quadrant_passage_targets, generate_scene,
-    generate_scene_text_lines, generate_tabular_motion_rows, render_scene_image_png,
-    render_scene_sound_wav, render_scene_video_frames_png, serialize_latent_artifact,
+    generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
+    render_scene_image_png_with_scene_config, render_scene_sound_wav,
+    render_scene_video_frames_png_with_keyframe_border, serialize_latent_artifact,
     serialize_scene_text, serialize_site_graph_artifact, serialize_tabular_motion_rows_csv,
     serialize_target_artifact, validate_site_graph_with_artifact,
 };
@@ -63,13 +64,17 @@ fn build_scene_materialization(
     let tabular_rows = generate_tabular_motion_rows(&output)
         .with_context(|| format!("tabular row generation failed for scene_index={scene_index}"))?;
     let tabular_csv = serialize_tabular_motion_rows_csv(&tabular_rows);
-    let text_lines = generate_scene_text_lines(&output)
+    let text_lines = generate_scene_text_lines_with_scene_config(&output, &config.scene)
         .with_context(|| format!("text generation failed for scene_index={scene_index}"))?;
     let text_body = serialize_scene_text(&text_lines);
-    let image_png_bytes = render_scene_image_png(&output, config.scene.resolution)
+    let image_png_bytes = render_scene_image_png_with_scene_config(&output, &config.scene)
         .with_context(|| format!("image rendering failed for scene_index={scene_index}"))?;
-    let video_frame_pngs = render_scene_video_frames_png(&output, config.scene.resolution)
-        .with_context(|| format!("video frame rendering failed for scene_index={scene_index}"))?;
+    let video_frame_pngs = render_scene_video_frames_png_with_keyframe_border(
+        &output,
+        config.scene.resolution,
+        config.scene.video_keyframe_border,
+    )
+    .with_context(|| format!("video frame rendering failed for scene_index={scene_index}"))?;
     let sound_wav_bytes = render_scene_sound_wav(
         &output,
         config.scene.sound_sample_rate_hz,
@@ -115,6 +120,7 @@ fn build_scene_materialization(
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_generate(
     config_path: Utf8PathBuf,
     output_dir: Utf8PathBuf,
@@ -190,8 +196,8 @@ pub(crate) fn run_generate(
     .context("failed to write metadata/site_metadata.toml")?;
 
     let scene_count_usize = scene_count as usize;
-    let split_assignment_result = build_split_assignments(scene_count_usize, &config.split)
-        .with_context(|| {
+    let split_assignment_result =
+        build_split_assignments(scene_count_usize).with_context(|| {
             format!("failed to build split assignments for scene_count={scene_count}")
         })?;
 
@@ -199,9 +205,8 @@ pub(crate) fn run_generate(
         master_seed: dataset_identity.master_seed,
         config_hash: dataset_identity.config_hash_hex.clone(),
         schema_version: config.schema_version,
-        split_policy: config.split.policy,
-        summary: split_assignment_result.summary,
-        assignments: split_assignment_result.assignments,
+        summary: split_assignment_result.summary.clone(),
+        assignments: split_assignment_result.assignments.clone(),
     };
     let split_metadata_toml = toml::to_string_pretty(&split_metadata)
         .context("failed to encode split assignments TOML")?;

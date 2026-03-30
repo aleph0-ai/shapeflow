@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::config::EasingFamily;
+use rand::RngCore;
+use rand_chacha::ChaCha8Rng;
+
+use crate::config::{EasingFamily, SceneConfig, TextReferenceFrame};
 use crate::scene_generation::SceneGenerationOutput;
 use crate::tabular_encoding::shape_identity_for_index;
 use crate::trajectory::NormalizedPoint;
@@ -11,6 +14,33 @@ pub enum TextAlterationProfile {
     EventClauseReordered,
     PairClauseReordered,
     FullyReordered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextSurfaceOptions {
+    pub text_reference_frame: TextReferenceFrame,
+    pub text_synonym_rate: f64,
+    pub text_typo_rate: f64,
+}
+
+impl Default for TextSurfaceOptions {
+    fn default() -> Self {
+        Self {
+            text_reference_frame: TextReferenceFrame::Canonical,
+            text_synonym_rate: 0.0,
+            text_typo_rate: 0.0,
+        }
+    }
+}
+
+impl TextSurfaceOptions {
+    pub fn from_scene_config(scene_cfg: &SceneConfig) -> Self {
+        Self {
+            text_reference_frame: scene_cfg.text_reference_frame,
+            text_synonym_rate: scene_cfg.text_synonym_rate,
+            text_typo_rate: scene_cfg.text_typo_rate,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,9 +61,13 @@ impl HorizontalSemanticRelation {
 
     fn parse(phrase: &str) -> Option<Self> {
         match phrase {
+            "to the left of" => Some(Self::LeftOf),
             "left of" => Some(Self::LeftOf),
+            "leftward of" => Some(Self::LeftOf),
+            "to the right of" => Some(Self::RightOf),
             "right of" => Some(Self::RightOf),
             "aligned horizontally with" => Some(Self::AlignedHorizontally),
+            "horizontally aligned with" => Some(Self::AlignedHorizontally),
             _ => None,
         }
     }
@@ -60,6 +94,7 @@ impl VerticalSemanticRelation {
             "above" => Some(Self::Above),
             "below" => Some(Self::Below),
             "aligned vertically with" => Some(Self::AlignedVertically),
+            "vertically aligned with" => Some(Self::AlignedVertically),
             _ => None,
         }
     }
@@ -79,6 +114,7 @@ pub struct EventSemanticFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairSemanticFrame {
     pub pair_index: usize,
+    pub event_index: u32,
     pub first_shape_id: String,
     pub second_shape_id: String,
     pub horizontal_relation: HorizontalSemanticRelation,
@@ -195,20 +231,26 @@ pub fn derive_scene_text_semantics(
         });
     }
 
-    let mut pairs = Vec::with_capacity(pair_sentence_count(shape_count));
+    let pairs_per_event = pair_sentence_count(shape_count);
+    let mut pairs = Vec::with_capacity(ordered_events.len().saturating_mul(pairs_per_event));
+    let mut current_positions = anchors.clone();
     let mut pair_index = 0usize;
-    for first_shape in 0..shape_count {
-        for second_shape in (first_shape + 1)..shape_count {
-            let first_anchor = anchors[first_shape];
-            let second_anchor = anchors[second_shape];
-            pairs.push(PairSemanticFrame {
-                pair_index,
-                first_shape_id: shape_ids[first_shape].clone(),
-                second_shape_id: shape_ids[second_shape].clone(),
-                horizontal_relation: horizontal_relation(first_anchor, second_anchor),
-                vertical_relation: vertical_relation(first_anchor, second_anchor),
-            });
-            pair_index += 1;
+    for event in &ordered_events {
+        current_positions[event.shape_index] = event.end_point;
+        for first_shape in 0..shape_count {
+            for second_shape in (first_shape + 1)..shape_count {
+                let first_position = current_positions[first_shape];
+                let second_position = current_positions[second_shape];
+                pairs.push(PairSemanticFrame {
+                    pair_index,
+                    event_index: event.global_event_index,
+                    first_shape_id: shape_ids[first_shape].clone(),
+                    second_shape_id: shape_ids[second_shape].clone(),
+                    horizontal_relation: horizontal_relation(first_position, second_position),
+                    vertical_relation: vertical_relation(first_position, second_position),
+                });
+                pair_index += 1;
+            }
         }
     }
 
@@ -223,8 +265,33 @@ pub fn generate_scene_text_lines_with_alteration(
     scene: &SceneGenerationOutput,
     profile: TextAlterationProfile,
 ) -> Result<Vec<String>, TextSemanticsError> {
+    let mut grammar_rng = scene.schedule.text_grammar_rng();
+    let mut lexical_rng = scene.schedule.lexical_noise_rng();
     let semantics = derive_scene_text_semantics(scene)?;
-    Ok(render_scene_text_lines_from_semantics(&semantics, profile))
+    Ok(render_scene_text_lines_from_semantics(
+        &semantics,
+        profile,
+        TextSurfaceOptions::default(),
+        &mut grammar_rng,
+        &mut lexical_rng,
+    ))
+}
+
+pub fn generate_scene_text_lines_with_scene_config(
+    scene: &SceneGenerationOutput,
+    scene_cfg: &SceneConfig,
+) -> Result<Vec<String>, TextSemanticsError> {
+    let mut grammar_rng = scene.schedule.text_grammar_rng();
+    let mut lexical_rng = scene.schedule.lexical_noise_rng();
+    let semantics = derive_scene_text_semantics(scene)?;
+    let options = TextSurfaceOptions::from_scene_config(scene_cfg);
+    Ok(render_scene_text_lines_from_semantics(
+        &semantics,
+        TextAlterationProfile::Canonical,
+        options,
+        &mut grammar_rng,
+        &mut lexical_rng,
+    ))
 }
 
 pub fn decode_scene_text_semantics(
@@ -234,14 +301,15 @@ pub fn decode_scene_text_semantics(
     let mut events = Vec::new();
     let mut pairs = Vec::new();
 
-    for line in content_lines {
+    for raw_line in content_lines {
+        let line = normalize_surface_variants(raw_line);
         if line.starts_with("Event ") {
-            events.push(parse_event_line(line)?);
+            events.push(parse_event_line(&line)?);
         } else if line.starts_with("Pair ") {
-            pairs.push(parse_pair_line(line)?);
+            pairs.push(parse_pair_line(&line)?);
         } else {
             return Err(TextSemanticsError::ParseLine {
-                line: line.to_string(),
+                line: raw_line.to_string(),
             });
         }
     }
@@ -281,6 +349,9 @@ pub fn decode_scene_text_semantics(
 fn render_scene_text_lines_from_semantics(
     semantics: &SceneTextSemantics,
     profile: TextAlterationProfile,
+    options: TextSurfaceOptions,
+    grammar_rng: &mut ChaCha8Rng,
+    lexical_rng: &mut ChaCha8Rng,
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(semantics.events.len() + semantics.pairs.len() + 1);
     lines.push(format!(
@@ -290,17 +361,36 @@ fn render_scene_text_lines_from_semantics(
     ));
 
     for event in &semantics.events {
-        lines.push(render_event_line(event, profile));
+        let reference_frame = choose_reference_frame(options.text_reference_frame, grammar_rng);
+        let mut line = render_event_line(event, profile, reference_frame);
+        line = apply_text_surface_variation(
+            line,
+            options.text_synonym_rate,
+            options.text_typo_rate,
+            lexical_rng,
+        );
+        lines.push(line);
     }
 
     for pair in &semantics.pairs {
-        lines.push(render_pair_line(pair, profile));
+        let mut line = render_pair_line(pair, profile);
+        line = apply_text_surface_variation(
+            line,
+            options.text_synonym_rate,
+            options.text_typo_rate,
+            lexical_rng,
+        );
+        lines.push(line);
     }
 
     lines
 }
 
-fn render_event_line(event: &EventSemanticFrame, profile: TextAlterationProfile) -> String {
+fn render_event_line(
+    event: &EventSemanticFrame,
+    profile: TextAlterationProfile,
+    reference_frame: TextReferenceFrame,
+) -> String {
     let simultaneous_suffix = if event.simultaneous_with.is_empty() {
         String::new()
     } else {
@@ -309,23 +399,29 @@ fn render_event_line(event: &EventSemanticFrame, profile: TextAlterationProfile)
             event.simultaneous_with.join(", ")
         )
     };
+    let relative_suffix = if reference_frame == TextReferenceFrame::Relative {
+        " relative to the scene"
+    } else {
+        ""
+    };
 
     match profile {
         TextAlterationProfile::Canonical | TextAlterationProfile::PairClauseReordered => format!(
-            "Event {:04}: the shape ({}) moved from ({:.6}, {:.6}) to ({:.6}, {:.6}) over {} frames using {}{}.",
+            "Event {:04}: the shape ({}) moved from ({:.6}, {:.6}) to ({:.6}, {:.6}){} over {} frames using {}{}.",
             event.event_index,
             event.shape_id,
             event.start_point.x,
             event.start_point.y,
             event.end_point.x,
             event.end_point.y,
+            relative_suffix,
             event.duration_frames,
             easing_family_name(event.easing),
             simultaneous_suffix
         ),
         TextAlterationProfile::EventClauseReordered | TextAlterationProfile::FullyReordered => {
             format!(
-                "Event {:04}: shape ({}) moved over {} frames using {} from ({:.6}, {:.6}) to ({:.6}, {:.6}){}.",
+                "Event {:04}: shape ({}) moved over {} frames using {} from ({:.6}, {:.6}) to ({:.6}, {:.6}){}{}.",
                 event.event_index,
                 event.shape_id,
                 event.duration_frames,
@@ -334,6 +430,7 @@ fn render_event_line(event: &EventSemanticFrame, profile: TextAlterationProfile)
                 event.start_point.y,
                 event.end_point.x,
                 event.end_point.y,
+                relative_suffix,
                 simultaneous_suffix
             )
         }
@@ -343,8 +440,9 @@ fn render_event_line(event: &EventSemanticFrame, profile: TextAlterationProfile)
 fn render_pair_line(pair: &PairSemanticFrame, profile: TextAlterationProfile) -> String {
     match profile {
         TextAlterationProfile::Canonical | TextAlterationProfile::EventClauseReordered => format!(
-            "Pair {:04}: {}, {} are {} and {}.",
+            "Pair {:04}: [event {:04}] {}, {} are {} and {}.",
             pair.pair_index,
+            pair.event_index,
             pair.first_shape_id,
             pair.second_shape_id,
             pair.horizontal_relation.as_phrase(),
@@ -352,14 +450,105 @@ fn render_pair_line(pair: &PairSemanticFrame, profile: TextAlterationProfile) ->
         ),
         TextAlterationProfile::PairClauseReordered | TextAlterationProfile::FullyReordered => {
             format!(
-                "Pair {:04}: {} is {} and {} relative to {}.",
+                "Pair {:04}: [event {:04}] {} is {} and {} relative to {}.",
                 pair.pair_index,
+                pair.event_index,
                 pair.first_shape_id,
                 pair.horizontal_relation.as_phrase(),
                 pair.vertical_relation.as_phrase(),
                 pair.second_shape_id
             )
         }
+    }
+}
+
+fn choose_reference_frame(
+    reference_frame: TextReferenceFrame,
+    grammar_rng: &mut ChaCha8Rng,
+) -> TextReferenceFrame {
+    match reference_frame {
+        TextReferenceFrame::Canonical | TextReferenceFrame::Relative => reference_frame,
+        TextReferenceFrame::Mixed => {
+            if should_apply_from_probability(0.5, grammar_rng) {
+                TextReferenceFrame::Relative
+            } else {
+                TextReferenceFrame::Canonical
+            }
+        }
+    }
+}
+
+fn apply_text_surface_variation(
+    line: String,
+    synonym_rate: f64,
+    typo_rate: f64,
+    lexical_rng: &mut ChaCha8Rng,
+) -> String {
+    let line = if should_apply_from_probability(synonym_rate, lexical_rng) {
+        apply_random_replacement(line, &SYNONYM_REPLACEMENTS, lexical_rng)
+    } else {
+        line
+    };
+
+    if should_apply_from_probability(typo_rate, lexical_rng) {
+        apply_random_replacement(line, &TYPO_REPLACEMENTS, lexical_rng)
+    } else {
+        line
+    }
+}
+
+const SYNONYM_REPLACEMENTS: [(&str, &str); 2] = [
+    ("moved", "translated"),
+    ("simultaneous with", "concurrent with"),
+];
+
+const TYPO_REPLACEMENTS: [(&str, &str); 3] = [
+    ("Event ", "Evnet "),
+    ("Pair ", "Piar "),
+    ("shape (", "shpae ("),
+];
+
+fn apply_random_replacement(
+    line: String,
+    replacements: &[(&str, &str)],
+    rng: &mut ChaCha8Rng,
+) -> String {
+    let candidate_indices = replacements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (from, _))| line.contains(from).then_some(index))
+        .collect::<Vec<_>>();
+    if candidate_indices.is_empty() {
+        return line;
+    }
+
+    let selected = candidate_indices[(rng.next_u32() as usize) % candidate_indices.len()];
+    let (from, to) = replacements[selected];
+    line.replacen(from, to, 1)
+}
+
+fn normalize_surface_variants(line: &str) -> String {
+    let mut normalized = line.to_string();
+    for (from, to) in [
+        ("Evnet ", "Event "),
+        ("Piar ", "Pair "),
+        ("shpae (", "shape ("),
+        ("movde", "moved"),
+        ("translated", "moved"),
+        ("concurrent with", "simultaneous with"),
+    ] {
+        normalized = normalized.replace(from, to);
+    }
+    normalized
+}
+
+fn should_apply_from_probability(probability: f64, rng: &mut ChaCha8Rng) -> bool {
+    if probability <= 0.0 || !probability.is_finite() {
+        false
+    } else if probability >= 1.0 {
+        true
+    } else {
+        (rng.next_u64() as f64) / (u64::MAX as f64) < probability
     }
 }
 
@@ -457,8 +646,26 @@ fn parse_pair_line(line: &str) -> Result<PairSemanticFrame, TextSemanticsError> 
         .ok_or_else(|| TextSemanticsError::ParseLine {
             line: line.to_string(),
         })?;
+    let (event_marker, relation_body) =
+        relation_text
+            .split_once("] ")
+            .ok_or_else(|| TextSemanticsError::ParseLine {
+                line: line.to_string(),
+            })?;
+    let event_index_text =
+        event_marker
+            .strip_prefix("[event ")
+            .ok_or_else(|| TextSemanticsError::ParseLine {
+                line: line.to_string(),
+            })?;
+    let event_index =
+        event_index_text
+            .parse::<u32>()
+            .map_err(|_| TextSemanticsError::ParseLine {
+                line: line.to_string(),
+            })?;
 
-    if let Some((shape_part, relation_part)) = relation_text.split_once(" are ") {
+    if let Some((shape_part, relation_part)) = relation_body.split_once(" are ") {
         let (first_shape_id, second_shape_id) =
             shape_part
                 .split_once(", ")
@@ -473,6 +680,7 @@ fn parse_pair_line(line: &str) -> Result<PairSemanticFrame, TextSemanticsError> 
                 })?;
         return Ok(PairSemanticFrame {
             pair_index,
+            event_index,
             first_shape_id: first_shape_id.to_string(),
             second_shape_id: second_shape_id.to_string(),
             horizontal_relation: HorizontalSemanticRelation::parse(horizontal_phrase).ok_or_else(
@@ -488,7 +696,7 @@ fn parse_pair_line(line: &str) -> Result<PairSemanticFrame, TextSemanticsError> 
         });
     }
 
-    if let Some((subject_part, tail)) = relation_text.split_once(" is ") {
+    if let Some((subject_part, tail)) = relation_body.split_once(" is ") {
         let (relation_part, object_part) =
             tail.split_once(" relative to ")
                 .ok_or_else(|| TextSemanticsError::ParseLine {
@@ -502,6 +710,7 @@ fn parse_pair_line(line: &str) -> Result<PairSemanticFrame, TextSemanticsError> 
                 })?;
         return Ok(PairSemanticFrame {
             pair_index,
+            event_index,
             first_shape_id: subject_part.to_string(),
             second_shape_id: object_part.to_string(),
             horizontal_relation: HorizontalSemanticRelation::parse(horizontal_phrase).ok_or_else(
@@ -662,7 +871,7 @@ mod tests {
         assert_eq!(canonical_semantics.events.len(), scene.motion_events.len());
         assert_eq!(
             canonical_semantics.pairs.len(),
-            pair_sentence_count(scene.shape_paths.len())
+            scene.motion_events.len() * pair_sentence_count(scene.shape_paths.len())
         );
 
         let profiles = [

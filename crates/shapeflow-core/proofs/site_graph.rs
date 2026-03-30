@@ -14,6 +14,8 @@ use vstd::prelude::*;
 
 verus! {
 
+pub const U64_MAX_VALUE: u64 = 18_446_744_073_709_551_615;
+
 pub open spec fn site_graph_min(lhs: nat, rhs: nat) -> nat {
     if lhs <= rhs {
         lhs
@@ -2387,6 +2389,18 @@ pub open spec fn lambda2_seed_with_offset(master_seed: nat, random_offset: nat) 
     master_seed + random_offset
 }
 
+pub proof fn lambda2_seed_with_offset_stays_in_u64_domain(
+    master_seed: nat,
+    random_offset: nat,
+)
+    requires
+        master_seed + random_offset <= (U64_MAX_VALUE as nat),
+    ensures
+        lambda2_seed_with_offset(master_seed, random_offset) <= (U64_MAX_VALUE as nat),
+{
+    assert(lambda2_seed_with_offset(master_seed, random_offset) == master_seed + random_offset);
+}
+
 pub proof fn lambda2_seed_with_offset_equal_inputs_equal_outputs(
     master_seed_a: nat,
     master_seed_b: nat,
@@ -2416,6 +2430,7 @@ pub proof fn lambda2_seed_with_offset_preserves_order(
 )
     requires
         lower_master_seed < higher_master_seed,
+        higher_master_seed + random_offset <= (U64_MAX_VALUE as nat),
     ensures
         lambda2_seed_with_offset(lower_master_seed, random_offset)
             < lambda2_seed_with_offset(higher_master_seed, random_offset),
@@ -2434,6 +2449,7 @@ pub proof fn lambda2_seed_with_offset_preserves_difference_for_bounded_pair(
 )
     requires
         smaller_master_seed <= larger_master_seed,
+        larger_master_seed + random_offset <= (U64_MAX_VALUE as nat),
     ensures
         lambda2_seed_with_offset(larger_master_seed, random_offset)
             - lambda2_seed_with_offset(smaller_master_seed, random_offset)

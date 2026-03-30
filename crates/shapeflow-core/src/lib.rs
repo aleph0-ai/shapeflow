@@ -25,10 +25,12 @@ pub use artifact_serialization::{
 };
 pub use config::{
     AxisNonlinearityFamily, CURRENT_SCHEMA_VERSION, DatasetIdentity, EasingFamily,
-    ParallelismConfig, PositionalLandscapeConfig, SceneConfig, ShapeFlowConfig,
-    SoundChannelMapping, SplitConfig, SplitPolicyConfig,
+    GenerationProfileConfig, ImageArrowType, ParallelismConfig, PositionalLandscapeConfig,
+    SceneConfig, ShapeFlowConfig, ShapeFlowConfigPreset, SoundChannelMapping, TextReferenceFrame,
 };
-pub use image_encoding::{ImageEncodingError, render_scene_image_png};
+pub use image_encoding::{
+    ImageEncodingError, render_scene_image_png, render_scene_image_png_with_scene_config,
+};
 pub use landscape::{LandscapeError, SoftQuadrantMembership, axis_membership, positional_identity};
 pub use landscape_validation::{
     LandscapeValidationError, LandscapeValidationReport, validate_empirical_landscape,
@@ -43,13 +45,13 @@ pub use seed_schedule::{
 };
 pub use site_graph::{
     SiteGraphValidationError, SiteGraphValidationReport, validate_site_graph,
-    validate_site_graph_with_artifact,
+    validate_site_graph_for_latent_vectors, validate_site_graph_with_artifact,
 };
 pub use sound_encoding::{SoundEncodingError, render_scene_sound_wav};
 pub use sound_validation::{SoundValidationError, SoundValidationReport, validate_scene_sound_wav};
 pub use split_assignments::{
     SceneSplitAssignment, SplitAssignmentError, SplitAssignmentResult, SplitAssignmentSummary,
-    SplitBucket, SplitPolicy, TheoryCohort, build_split_assignments,
+    SplitBucket, build_split_assignments,
 };
 pub use tabular_encoding::{
     ShapeIdentity, TabularEncodingError, TabularMotionRow, canonical_scene_id,
@@ -59,12 +61,21 @@ pub use target_generation::{
     OrderedQuadrantPassageTarget, TargetGenerationError, TargetValidationReport,
     generate_ordered_quadrant_passage_targets, validate_ordered_quadrant_passage_targets,
 };
-pub use text_encoding::{TextEncodingError, generate_scene_text_lines, serialize_scene_text};
+pub use text_encoding::{
+    TextEncodingError, generate_scene_text_lines, generate_scene_text_lines_with_scene_config,
+    serialize_scene_text,
+};
 pub use text_semantics::{
     EventSemanticFrame, HorizontalSemanticRelation, PairSemanticFrame, SceneTextSemantics,
     TextAlterationProfile, TextSemanticsError, VerticalSemanticRelation,
     decode_scene_text_semantics, derive_scene_text_semantics,
     generate_scene_text_lines_with_alteration,
 };
-pub use trajectory::{NormalizedPoint, TrajectoryError, sample_random_linear_path_points};
-pub use video_encoding::{VideoEncodingError, render_scene_video_frames_png};
+pub use trajectory::{
+    NormalizedPoint, TrajectoryError, sample_random_linear_path_points,
+    sample_random_linear_path_points_with_complexity,
+};
+pub use video_encoding::{
+    VideoEncodingError, render_scene_video_frames_png,
+    render_scene_video_frames_png_with_keyframe_border,
+};

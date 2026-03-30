@@ -15,6 +15,7 @@ use shapeflow_core::{
     validate_site_graph_with_artifact,
 };
 
+#[allow(dead_code)]
 pub(crate) fn run_validate(
     config_path: Utf8PathBuf,
     generated_output: Option<Utf8PathBuf>,
@@ -49,6 +50,7 @@ pub(crate) fn run_validate(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_validate_with_generated_materialization(
     config_path: Utf8PathBuf,
     generated_output: Option<Utf8PathBuf>,
@@ -258,10 +260,9 @@ pub(crate) fn run_validate_with_generated_materialization(
 
     if split_assignments {
         ensure!(scene_count > 0, "scene_count must be > 0");
-        let result =
-            build_split_assignments(scene_count as usize, &config.split).with_context(|| {
-                format!("split-assignment validation failed for scene_count={scene_count}")
-            })?;
+        let result = build_split_assignments(scene_count as usize).with_context(|| {
+            format!("split-assignment validation failed for scene_count={scene_count}")
+        })?;
         ensure!(
             result.assignments.len() == result.summary.total_count,
             "split assignment summary total_count does not match assignment length: summary_total={}, assignments_len={}",
@@ -279,13 +280,12 @@ pub(crate) fn run_validate_with_generated_materialization(
         );
         println!("validation=split-assignments-ok");
         println!(
-            "validated_scene_count={}, train_count={}, val_count={}, test_count={}, total_count={}, split_policy={:?}",
+            "validated_scene_count={}, train_count={}, val_count={}, test_count={}, total_count={}",
             scene_count,
             result.summary.train_count,
             result.summary.val_count,
             result.summary.test_count,
             result.summary.total_count,
-            config.split.policy
         );
         ran_specific_check = true;
     }

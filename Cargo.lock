@@ -916,6 +916,7 @@ name = "shapeflow-py"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "serde",
  "shapeflow-core",
  "thiserror",
  "toml",

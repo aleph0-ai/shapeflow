@@ -5,11 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "shapeflow_py"
+name = "shapeflow"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { workspace = true, features = ["auto-initialize"] }
+serde.workspace = true
 shapeflow-core = { path = "../shapeflow-core" }
 thiserror.workspace = true
 toml.workspace = true
