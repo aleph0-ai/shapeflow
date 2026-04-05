@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, ensure};
 use shapeflow_core::{
     SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig, canonical_scene_id,
-    generate_ordered_quadrant_passage_targets, generate_scene, shape_identity_for_index,
-    validate_ordered_quadrant_passage_targets,
+    generate_all_scene_targets, generate_scene, shape_identity_for_index,
+    validate_generated_targets,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,7 @@ struct SceneInspectReport {
     shape_summaries: Vec<ShapeInspectSummary>,
     target_count: usize,
     total_target_segments: usize,
-    hard_target_segments: usize,
+    total_target_values: usize,
     target_segment_counts: Vec<(String, usize)>,
 }
 
@@ -109,19 +109,14 @@ fn build_scene_inspection_report(
     }
     shape_summaries.sort_by_key(|summary| summary.shape_index);
 
-    let mut targets = generate_ordered_quadrant_passage_targets(&output)
+    let mut targets = generate_all_scene_targets(&output)
         .with_context(|| format!("target generation failed for scene_index={scene_index}"))?;
-    targets.sort_by_key(|target| target.shape_index);
-    let target_validation = validate_ordered_quadrant_passage_targets(&targets)
+    targets.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    let target_validation = validate_generated_targets(&targets)
         .with_context(|| format!("target validation failed for scene_index={scene_index}"))?;
     let target_segment_counts = targets
         .iter()
-        .map(|target| {
-            (
-                format!("oqp{:04}", target.shape_index),
-                target.segments.len(),
-            )
-        })
+        .map(|target| (target.task_id.clone(), target.segments.len()))
         .collect::<Vec<_>>();
 
     Ok(SceneInspectReport {
@@ -138,9 +133,9 @@ fn build_scene_inspection_report(
         schedule_text_grammar: output.schedule.text_grammar,
         schedule_lexical_noise: output.schedule.lexical_noise,
         shape_summaries,
-        target_count: target_validation.shape_target_count,
+        target_count: target_validation.target_count,
         total_target_segments: target_validation.total_segments,
-        hard_target_segments: target_validation.hard_segment_count,
+        total_target_values: target_validation.total_values,
         target_segment_counts,
     })
 }
@@ -184,10 +179,10 @@ fn print_scene_inspection_report(report: &SceneInspectReport) {
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "target_count={}, total_target_segments={}, hard_target_segments={}, target_segments={}",
+        "target_count={}, total_target_segments={}, total_target_values={}, target_segments={}",
         report.target_count,
         report.total_target_segments,
-        report.hard_target_segments,
+        report.total_target_values,
         target_segments
     );
 }
@@ -217,8 +212,8 @@ mod tests {
         );
         assert_eq!(
             report.target_count,
-            report.shape_summaries.len(),
-            "one oqp target should exist per shape"
+            shapeflow_core::expected_target_task_ids(report.shape_summaries.len()).len(),
+            "all expected target surfaces should exist"
         );
         assert!(
             report.total_target_segments >= report.target_count,

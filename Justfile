@@ -73,6 +73,10 @@ lean-check:
                 lean "${f}"
         done
 
+human-eval:
+        mkdir -p target
+        cargo run -p shapeflow-cli -- human-eval --bind 127.0.0.1:8080 --sqlite-path target/human_eval.sqlite
+
 clean:
         rm -rf build
         cargo clean

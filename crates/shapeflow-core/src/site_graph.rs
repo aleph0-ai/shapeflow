@@ -79,6 +79,7 @@ pub fn validate_site_graph_with_artifact(
 
     let scene_count = config.site_graph.validation_scene_count as usize;
     let mut scene_vectors = Vec::with_capacity(scene_count);
+    let mut max_vector_len = 0usize;
     for scene_index in 0..config.site_graph.validation_scene_count {
         let params = SceneGenerationParams {
             config,
@@ -88,8 +89,11 @@ pub fn validate_site_graph_with_artifact(
         };
         let scene = generate_scene(&params)?;
         let vector = extract_latent_vector_from_scene(&scene)?;
-        validate_vector_length(&scene_vectors, scene_index, vector.len())?;
+        max_vector_len = max_vector_len.max(vector.len());
         scene_vectors.push(vector);
+    }
+    for vector in &mut scene_vectors {
+        vector.resize(max_vector_len, 0.0);
     }
 
     validate_site_graph_for_latent_vectors(
@@ -525,13 +529,14 @@ mod tests {
 
     use crate::config::{
         AxisNonlinearityFamily, ConfigError, EasingFamily, ImageArrowType, ParallelismConfig,
-        PositionalLandscapeConfig, SceneConfig, SoundChannelMapping, TextReferenceFrame,
+        PositionalLandscapeConfig, SceneConfig, ShapeIdentityAssignment, SoundChannelMapping,
+        TextReferenceFrame,
     };
     use std::collections::BTreeSet;
 
     fn sample_config() -> ShapeFlowConfig {
         ShapeFlowConfig {
-            schema_version: 1,
+            schema_version: crate::config::CURRENT_SCHEMA_VERSION,
             master_seed: 1234,
             generation_profile: None,
             scene: SceneConfig {
@@ -540,9 +545,13 @@ mod tests {
                 trajectory_complexity: 2,
                 event_duration_frames: 12,
                 easing_family: EasingFamily::EaseInOut,
+                n_motion_slots: 6,
                 motion_events_per_shape: vec![3, 3],
-                n_motion_events_total: 6,
+                n_motion_events_total: None,
                 allow_simultaneous: true,
+                shape_identity_assignment: ShapeIdentityAssignment::IndexLocked,
+                randomize_motion_events_per_shape: false,
+                motion_events_per_shape_random_ranges: None,
                 sound_sample_rate_hz: 44_100,
                 sound_frames_per_second: 24,
                 sound_modulation_depth_per_mille: 250,

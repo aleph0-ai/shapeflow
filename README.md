@@ -239,13 +239,20 @@ master_seed = 42                                # Deterministic master seed; exc
 
 [scene]
 resolution = 512                                # Square canvas side in pixels
-n_shapes = 2                                    # Number of shapes per scene
+n_shapes = 3                                    # Number of shapes per scene
 trajectory_complexity = 2                       # Trajectory complexity tier
 event_duration_frames = 24                      # Duration of each motion event in frames
 easing_family = "ease_in_out"                   # Motion interpolation family
-motion_events_per_shape = [3, 3]                # Per-shape event counts; must sum to n_motion_events_total
-n_motion_events_total = 6                       # Total scene-wide event count
-allow_simultaneous = true                       # Allow concurrent shape movement
+n_motion_slots = 12                             # Total motion slots (comic-strip panels / timeline slots)
+# n_motion_events_total = 12                    # Optional cap on total shape-motion events (omit for no cap)
+shape_identity_assignment = "pair_unique_random" # Shape-color identity mode: index_locked | pair_unique_random
+motion_events_per_shape_random_ranges = [         # Optional per-shape random event count bounds (set together with randomization)
+  { min = 1, max = 12 },
+  { min = 1, max = 12 },
+  { min = 1, max = 12 },
+]
+allow_simultaneous = true                       # Enable tandem motion (multiple shapes may share a time slot)
+randomize_motion_events_per_shape = true        # Deterministically randomize per-shape counts
 sound_sample_rate_hz = 44100                    # Sound output sample rate
 sound_frames_per_second = 24                    # Audio synthesis frame rate
 sound_modulation_depth_per_mille = 250          # Sound modulation depth in per-mille units
@@ -277,6 +284,13 @@ Notes:
 
 - `config_hash` intentionally excludes `master_seed` and `schema_version`.
 - `generation_profile` (when present) participates in `config_hash` as provenance context.
+- `motion_events_per_shape` and `motion_events_per_shape_random_ranges` are mutually exclusive config sources.
+- `n_motion_slots` controls the fixed slot timeline (image panels/video slots/audio slots), and slots may be empty.
+- `n_motion_events_total` is optional and acts as a cap on total generated events.
+- `randomize_motion_events_per_shape = true` with no `motion_events_per_shape_random_ranges` samples per-shape counts in `[0, n_motion_slots]`, deterministically by scene seed.
+- `motion_events_per_shape_random_ranges` (when present) enables per-shape min/max sampling in `[min, max]`, also deterministic by scene seed.
+- `shape_identity_assignment = "index_locked"` uses fixed index-based identity mapping (current behavior before pair-random mode).
+- `shape_identity_assignment = "pair_unique_random"` uses deterministic seed-based (shape, color) pair assignment, allowing duplicate shapes across colors and duplicate colors across shapes.
 - `scene_count` and `samples_per_event` must be `> 0` for generation-backed checks.
 - Split behavior is explicit in generation/materialization commands; it is not an implicit config side-effect.
 - Python materialization does not emit Split-E sidecar spectral metadata artifacts.
@@ -365,13 +379,15 @@ from shapeflow import (
 cfg = ShapeFlowConfig(
     master_seed=1234,
     resolution=512,
-    n_shapes=2,
+    n_shapes=3,
     trajectory_complexity=2,
     event_duration_frames=24,
     easing_family="ease_in_out",
-    motion_events_per_shape=[3, 3],
-    n_motion_events_total=6,
-    allow_simultaneous=True,
+    n_motion_slots=12,
+    motion_events_per_shape=[4, 4, 4],
+    n_motion_events_total=None,
+    allow_simultaneous=False,
+    shape_identity_assignment="pair_unique_random",
     sound_sample_rate_hz=44100,
     sound_frames_per_second=24,
     sound_modulation_depth_per_mille=250,
@@ -396,13 +412,15 @@ cfg = ShapeFlowConfig(
 cfg = ShapeFlowConfig.with_defaults(
     master_seed=1234,
     resolution=512,
-    n_shapes=2,
+    n_shapes=3,
     trajectory_complexity=2,
     event_duration_frames=24,
     easing_family="ease_in_out",
-    motion_events_per_shape=[3, 3],
-    n_motion_events_total=6,
-    allow_simultaneous=True,
+    n_motion_slots=12,
+    motion_events_per_shape=[4, 4, 4],
+    n_motion_events_total=None,
+    allow_simultaneous=False,
+    shape_identity_assignment="pair_unique_random",
     sound_sample_rate_hz=44100,
     sound_frames_per_second=24,
     sound_modulation_depth_per_mille=250,
@@ -425,6 +443,8 @@ cfg = ShapeFlowConfig.from_policy_with_defaults(
 # cfg = cfg.apply_policy(ShapeFlowConfigPreset.SpectralGap)
 
 cfg = ShapeFlowConfig.from_toml("configs/bootstrap.toml")
+# Use TOML loading when you need per-shape random range controls:
+# randomize_motion_events_per_shape + motion_events_per_shape_random_ranges.
 
 print(cfg.dataset_identity())  # includes generation_profile + version when preset-backed
 cfg.write_toml("tmp_config.toml")

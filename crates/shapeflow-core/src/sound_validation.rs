@@ -139,7 +139,15 @@ fn expected_samples_per_channel(
     frames_per_second: u16,
 ) -> Result<usize, SoundValidationError> {
     let shape_count = scene.shape_paths.len();
-    let mut durations_by_slot = BTreeMap::<u32, u16>::new();
+    let default_duration_frames = scene
+        .motion_events
+        .iter()
+        .min_by_key(|event| event.time_slot)
+        .map(|event| event.duration_frames)
+        .ok_or(SoundValidationError::EmptyScene)?;
+    let mut durations_by_slot = (0..scene.accounting.expected_slots)
+        .map(|slot| (slot, None))
+        .collect::<BTreeMap<u32, Option<u16>>>();
     for event in &scene.motion_events {
         if event.shape_index >= shape_count {
             return Err(SoundValidationError::Rendering(
@@ -157,28 +165,39 @@ fn expected_samples_per_channel(
             ));
         }
 
-        match durations_by_slot.get(&event.time_slot) {
-            Some(expected) if *expected != event.duration_frames => {
-                return Err(SoundValidationError::Rendering(
-                    SoundEncodingError::MismatchedSlotDuration {
-                        time_slot: event.time_slot,
-                        expected: *expected,
-                        found: event.duration_frames,
-                        global_event_index: event.global_event_index,
-                    },
-                ));
+        match durations_by_slot.get_mut(&event.time_slot) {
+            Some(expected_duration) => {
+                if let Some(expected) = *expected_duration {
+                    if expected != event.duration_frames {
+                        return Err(SoundValidationError::Rendering(
+                            SoundEncodingError::MismatchedSlotDuration {
+                                time_slot: event.time_slot,
+                                expected,
+                                found: event.duration_frames,
+                                global_event_index: event.global_event_index,
+                            },
+                        ));
+                    }
+                } else {
+                    *expected_duration = Some(event.duration_frames);
+                }
             }
-            Some(_) => {}
             None => {
-                durations_by_slot.insert(event.time_slot, event.duration_frames);
+                return Err(SoundValidationError::Rendering(
+                    SoundEncodingError::WavEncoding(format!(
+                        "event time_slot {} exceeds declared slot count {}",
+                        event.time_slot, scene.accounting.expected_slots
+                    )),
+                ));
             }
         }
     }
 
     let mut total_samples = 0usize;
     for duration_frames in durations_by_slot.values() {
+        let duration_frames = duration_frames.unwrap_or(default_duration_frames);
         let slot_samples = usize::try_from(
-            (u128::from(*duration_frames) * u128::from(sample_rate_hz)
+            (u128::from(duration_frames) * u128::from(sample_rate_hz)
                 + (u128::from(frames_per_second) - 1))
                 / u128::from(frames_per_second),
         )
@@ -200,7 +219,7 @@ fn channel_count(channel_mapping: SoundChannelMapping) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::EasingFamily;
+    use crate::config::{EasingFamily, ShapeIdentityAssignment};
     use crate::scene_generation::{
         MotionEvent, MotionEventAccounting, SceneGenerationOutput, SceneGenerationParams,
         SceneProjectionMode, SceneShapePath, generate_scene,
@@ -242,10 +261,17 @@ mod tests {
         }
         let expected_total =
             u32::try_from(motion_events.len()).expect("motion-event length should fit u32");
+        let expected_slots = motion_events
+            .iter()
+            .map(|event| event.time_slot)
+            .max()
+            .unwrap_or(0)
+            + 1;
 
         SceneGenerationOutput {
             scene_index: 0,
             schedule: SceneSeedSchedule::derive(7, 0),
+            shape_identity_assignment: ShapeIdentityAssignment::IndexLocked,
             shape_paths: (0..shape_count)
                 .map(|shape_index| SceneShapePath {
                     shape_index,
@@ -256,6 +282,7 @@ mod tests {
             motion_events,
             accounting: MotionEventAccounting {
                 expected_total,
+                expected_slots,
                 generated_total: expected_total,
                 expected_per_shape: generated_per_shape.clone(),
                 generated_per_shape,

@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use rand::RngCore;
 use rand_chacha::ChaCha8Rng;
 
 use crate::config::{EasingFamily, SceneConfig, TextReferenceFrame};
 use crate::scene_generation::SceneGenerationOutput;
-use crate::tabular_encoding::shape_identity_for_index;
+use crate::tabular_encoding::shape_identity_for_scene;
 use crate::trajectory::NormalizedPoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +108,58 @@ pub struct EventSemanticFrame {
     pub end_point: NormalizedPoint,
     pub duration_frames: u16,
     pub easing: EasingFamily,
-    pub simultaneous_with: Vec<String>,
+    pub simultaneous_with: Vec<SimultaneousEventRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimultaneousEventRef {
+    pub event_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quadrant {
+    TopRight,
+    TopLeft,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Quadrant {
+    fn as_phrase(self) -> &'static str {
+        match self {
+            Self::TopRight => "top right",
+            Self::TopLeft => "top left",
+            Self::BottomLeft => "bottom left",
+            Self::BottomRight => "bottom right",
+        }
+    }
+
+    fn center_point(self) -> NormalizedPoint {
+        match self {
+            Self::TopRight => {
+                NormalizedPoint::new(0.5, 0.5).expect("top-right center must be normalized")
+            }
+            Self::TopLeft => {
+                NormalizedPoint::new(-0.5, 0.5).expect("top-left center must be normalized")
+            }
+            Self::BottomLeft => {
+                NormalizedPoint::new(-0.5, -0.5).expect("bottom-left center must be normalized")
+            }
+            Self::BottomRight => {
+                NormalizedPoint::new(0.5, -0.5).expect("bottom-right center must be normalized")
+            }
+        }
+    }
+
+    fn parse(phrase: &str) -> Option<Self> {
+        match phrase.trim() {
+            "top right" => Some(Self::TopRight),
+            "top left" => Some(Self::TopLeft),
+            "bottom left" => Some(Self::BottomLeft),
+            "bottom right" => Some(Self::BottomRight),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +230,7 @@ pub fn derive_scene_text_semantics(
     let mut anchors = Vec::with_capacity(shape_count);
 
     for shape_index in 0..shape_count {
-        let identity = shape_identity_for_index(shape_index)
+        let identity = shape_identity_for_scene(scene, shape_index)
             .map_err(|error| TextSemanticsError::ShapeIdentity(error.to_string()))?;
         let anchor_point = scene
             .shape_paths
@@ -193,7 +244,7 @@ pub fn derive_scene_text_semantics(
         anchors.push(anchor_point);
     }
 
-    let mut time_slot_shapes: BTreeMap<u32, BTreeSet<usize>> = BTreeMap::new();
+    let mut time_slot_events: BTreeMap<u32, Vec<(u32, usize)>> = BTreeMap::new();
     for event in &scene.motion_events {
         if event.shape_index >= shape_count {
             return Err(TextSemanticsError::ShapeIndexOutOfBounds {
@@ -201,10 +252,10 @@ pub fn derive_scene_text_semantics(
                 shape_count,
             });
         }
-        time_slot_shapes
+        time_slot_events
             .entry(event.time_slot)
             .or_default()
-            .insert(event.shape_index);
+            .push((event.global_event_index, event.shape_index));
     }
 
     let mut ordered_events = scene.motion_events.clone();
@@ -212,14 +263,16 @@ pub fn derive_scene_text_semantics(
 
     let mut events = Vec::with_capacity(ordered_events.len());
     for event in &ordered_events {
-        let simultaneous_with = time_slot_shapes
+        let mut simultaneous_with = time_slot_events
             .get(&event.time_slot)
             .expect("time slot should exist for every event")
             .iter()
-            .copied()
-            .filter(|shape_index| *shape_index != event.shape_index)
-            .map(|shape_index| shape_ids[shape_index].clone())
+            .filter(|(peer_event_index, _)| *peer_event_index != event.global_event_index)
+            .map(|(peer_event_index, _)| SimultaneousEventRef {
+                event_index: *peer_event_index,
+            })
             .collect::<Vec<_>>();
+        simultaneous_with.sort_by_key(|peer| peer.event_index);
         events.push(EventSemanticFrame {
             event_index: event.global_event_index,
             shape_id: shape_ids[event.shape_index].clone(),
@@ -391,48 +444,186 @@ fn render_event_line(
     profile: TextAlterationProfile,
     reference_frame: TextReferenceFrame,
 ) -> String {
-    let simultaneous_suffix = if event.simultaneous_with.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " while simultaneous with {}",
-            event.simultaneous_with.join(", ")
-        )
-    };
-    let relative_suffix = if reference_frame == TextReferenceFrame::Relative {
-        " relative to the scene"
+    let reference_suffix = if reference_frame == TextReferenceFrame::Relative {
+        " relative to the scene center"
     } else {
         ""
     };
+    let movement_clause = render_event_movement_clause(event);
+    let shape_label = render_shape_label(&event.shape_id);
+    let simultaneous_clause = render_simultaneous_clause(&event.simultaneous_with);
 
     match profile {
-        TextAlterationProfile::Canonical | TextAlterationProfile::PairClauseReordered => format!(
-            "Event {:04}: the shape ({}) moved from ({:.6}, {:.6}) to ({:.6}, {:.6}){} over {} frames using {}{}.",
-            event.event_index,
-            event.shape_id,
-            event.start_point.x,
-            event.start_point.y,
-            event.end_point.x,
-            event.end_point.y,
-            relative_suffix,
-            event.duration_frames,
-            easing_family_name(event.easing),
-            simultaneous_suffix
-        ),
+        TextAlterationProfile::Canonical | TextAlterationProfile::PairClauseReordered => {
+            if let Some(simultaneous_clause) = simultaneous_clause {
+                format!(
+                    "Event {:04}: {} moved {}{}. This happened at the same time as {}.",
+                    event.event_index,
+                    shape_label,
+                    movement_clause,
+                    reference_suffix,
+                    simultaneous_clause
+                )
+            } else {
+                format!(
+                    "Event {:04}: {} moved {}{}.",
+                    event.event_index, shape_label, movement_clause, reference_suffix
+                )
+            }
+        }
         TextAlterationProfile::EventClauseReordered | TextAlterationProfile::FullyReordered => {
-            format!(
-                "Event {:04}: shape ({}) moved over {} frames using {} from ({:.6}, {:.6}) to ({:.6}, {:.6}){}{}.",
-                event.event_index,
-                event.shape_id,
-                event.duration_frames,
-                easing_family_name(event.easing),
-                event.start_point.x,
-                event.start_point.y,
-                event.end_point.x,
-                event.end_point.y,
-                relative_suffix,
-                simultaneous_suffix
-            )
+            if let Some(simultaneous_clause) = simultaneous_clause {
+                format!(
+                    "Event {:04}: At the same time as {}, {} moved {}{}.",
+                    event.event_index,
+                    simultaneous_clause,
+                    shape_label,
+                    movement_clause,
+                    reference_suffix
+                )
+            } else {
+                format!(
+                    "Event {:04}: {} moved {}{}.",
+                    event.event_index, shape_label, movement_clause, reference_suffix
+                )
+            }
+        }
+    }
+}
+
+fn render_event_movement_clause(event: &EventSemanticFrame) -> String {
+    let path = sampled_quadrant_path(event);
+    if path.is_empty() {
+        return "within top left quadrant".to_string();
+    }
+
+    if path.len() == 1 {
+        return format!("within {} quadrant", path[0].as_phrase());
+    }
+
+    let start = path.first().expect("non-empty path");
+    let end = path.last().expect("non-empty path");
+    let through = &path[1..path.len() - 1];
+    if through.is_empty() {
+        format!(
+            "from {} quadrant to {} quadrant",
+            start.as_phrase(),
+            end.as_phrase()
+        )
+    } else {
+        format!(
+            "from {} quadrant to {} quadrant through {}",
+            start.as_phrase(),
+            end.as_phrase(),
+            render_quadrant_list(through)
+        )
+    }
+}
+
+fn render_quadrant_list(quadrants: &[Quadrant]) -> String {
+    let parts = quadrants
+        .iter()
+        .map(|quadrant| format!("{} quadrant", quadrant.as_phrase()))
+        .collect::<Vec<_>>();
+    render_list_with_and(&parts)
+}
+
+fn render_shape_label(shape_id: &str) -> String {
+    if let Some((shape_type, color)) = shape_id.split_once('_') {
+        return format!("{} {} shape", color, shape_type);
+    }
+    shape_id.to_string()
+}
+
+fn parse_shape_label(label: &str) -> Option<String> {
+    let label = label.trim();
+    let label = label.strip_suffix(" shape")?;
+    let mut parts = label.split_whitespace();
+    let color = parts.next()?;
+    let shape_type = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{shape_type}_{color}"))
+}
+
+fn render_simultaneous_clause(simultaneous_with: &[SimultaneousEventRef]) -> Option<String> {
+    if simultaneous_with.is_empty() {
+        return None;
+    }
+    let mut event_indices = simultaneous_with
+        .iter()
+        .map(|peer| peer.event_index)
+        .collect::<Vec<_>>();
+    event_indices.sort_unstable();
+    let parts = event_indices
+        .into_iter()
+        .map(|event_index| format!("Event {:04}", event_index))
+        .collect::<Vec<_>>();
+    Some(render_list_with_and(&parts))
+}
+
+fn render_list_with_and(items: &[String]) -> String {
+    match items.len() {
+        0 => String::new(),
+        1 => items[0].clone(),
+        2 => format!("{} and {}", items[0], items[1]),
+        _ => {
+            let mut body = items[..items.len() - 1].join(", ");
+            body.push_str(", and ");
+            body.push_str(&items[items.len() - 1]);
+            body
+        }
+    }
+}
+
+fn sampled_quadrant_path(event: &EventSemanticFrame) -> Vec<Quadrant> {
+    let sample_count = usize::from(event.duration_frames.max(2));
+    let mut path = Vec::new();
+    for index in 0..sample_count {
+        let t = if sample_count <= 1 {
+            1.0
+        } else {
+            index as f64 / (sample_count - 1) as f64
+        };
+        let eased = easing_progress(t, event.easing);
+        let x = lerp(event.start_point.x, event.end_point.x, eased);
+        let y = lerp(event.start_point.y, event.end_point.y, eased);
+        let quadrant = dominant_quadrant(x, y);
+        if path.last().copied() != Some(quadrant) {
+            path.push(quadrant);
+        }
+    }
+    path
+}
+
+fn dominant_quadrant(x: f64, y: f64) -> Quadrant {
+    if x >= 0.0 && y >= 0.0 {
+        Quadrant::TopRight
+    } else if x < 0.0 && y >= 0.0 {
+        Quadrant::TopLeft
+    } else if x < 0.0 && y < 0.0 {
+        Quadrant::BottomLeft
+    } else {
+        Quadrant::BottomRight
+    }
+}
+
+fn lerp(start: f64, end: f64, t: f64) -> f64 {
+    start + (end - start) * t
+}
+
+fn easing_progress(progress: f64, easing: EasingFamily) -> f64 {
+    match easing {
+        EasingFamily::Linear => progress,
+        EasingFamily::EaseIn => progress * progress,
+        EasingFamily::EaseOut => 1.0 - (1.0 - progress) * (1.0 - progress),
+        EasingFamily::EaseInOut => {
+            if progress < 0.5 {
+                2.0 * progress * progress
+            } else {
+                1.0 - ((-2.0 * progress + 2.0) * (-2.0 * progress + 2.0)) / 2.0
+            }
         }
     }
 }
@@ -440,22 +631,24 @@ fn render_event_line(
 fn render_pair_line(pair: &PairSemanticFrame, profile: TextAlterationProfile) -> String {
     match profile {
         TextAlterationProfile::Canonical | TextAlterationProfile::EventClauseReordered => format!(
-            "Pair {:04}: [event {:04}] {}, {} are {} and {}.",
+            "Pair {:04}: [event {:04}] {} is {} {} and is {} {}.",
             pair.pair_index,
             pair.event_index,
             pair.first_shape_id,
-            pair.second_shape_id,
             pair.horizontal_relation.as_phrase(),
-            pair.vertical_relation.as_phrase()
+            pair.second_shape_id,
+            pair.vertical_relation.as_phrase(),
+            pair.second_shape_id
         ),
         TextAlterationProfile::PairClauseReordered | TextAlterationProfile::FullyReordered => {
             format!(
-                "Pair {:04}: [event {:04}] {} is {} and {} relative to {}.",
+                "Pair {:04}: [event {:04}] {} is {} {} and is {} {}.",
                 pair.pair_index,
                 pair.event_index,
                 pair.first_shape_id,
-                pair.horizontal_relation.as_phrase(),
                 pair.vertical_relation.as_phrase(),
+                pair.second_shape_id,
+                pair.horizontal_relation.as_phrase(),
                 pair.second_shape_id
             )
         }
@@ -497,15 +690,12 @@ fn apply_text_surface_variation(
     }
 }
 
-const SYNONYM_REPLACEMENTS: [(&str, &str); 2] = [
-    ("moved", "translated"),
-    ("simultaneous with", "concurrent with"),
-];
+const SYNONYM_REPLACEMENTS: [(&str, &str); 1] = [("moved", "translated")];
 
 const TYPO_REPLACEMENTS: [(&str, &str); 3] = [
     ("Event ", "Evnet "),
     ("Pair ", "Piar "),
-    ("shape (", "shpae ("),
+    (" shape moved", " shpae moved"),
 ];
 
 fn apply_random_replacement(
@@ -532,10 +722,8 @@ fn normalize_surface_variants(line: &str) -> String {
     for (from, to) in [
         ("Evnet ", "Event "),
         ("Piar ", "Pair "),
-        ("shpae (", "shape ("),
-        ("movde", "moved"),
+        (" shpae moved", " shape moved"),
         ("translated", "moved"),
-        ("concurrent with", "simultaneous with"),
     ] {
         normalized = normalized.replace(from, to);
     }
@@ -589,51 +777,61 @@ fn parse_header(lines: &[String]) -> Result<(u64, usize, &[String]), TextSemanti
 
 fn parse_event_line(line: &str) -> Result<EventSemanticFrame, TextSemanticsError> {
     let (event_index, body) = parse_indexed_line_prefix(line, "Event")?;
+    let body = body.trim();
+    let mut simultaneous_with = Vec::new();
 
-    let shape_id =
-        extract_between(body, "shape (", ")").ok_or_else(|| TextSemanticsError::ParseLine {
-            line: line.to_string(),
-        })?;
+    let (body, prefix_simultaneous_clause) =
+        if let Some(rest) = body.strip_prefix("At the same time as ") {
+            let (simultaneous_text, tail) =
+                rest.split_once(", ")
+                    .ok_or_else(|| TextSemanticsError::ParseLine {
+                        line: line.to_string(),
+                    })?;
+            (tail, Some(simultaneous_text))
+        } else {
+            (body, None)
+        };
 
-    let duration_frames = parse_u16_between(body, " over ", " frames using ").ok_or_else(|| {
-        TextSemanticsError::ParseLine {
-            line: line.to_string(),
-        }
+    let body = body.trim_end_matches('.');
+    let (movement_clause, suffix_simultaneous_clause) =
+        if let Some((head, tail)) = body.split_once(". This happened at the same time as ") {
+            (head, Some(tail))
+        } else {
+            (body, None)
+        };
+
+    if let Some(text) = prefix_simultaneous_clause {
+        simultaneous_with.extend(parse_simultaneous_clause(text, line)?);
+    }
+    if let Some(text) = suffix_simultaneous_clause {
+        simultaneous_with.extend(parse_simultaneous_clause(text, line)?);
+    }
+    simultaneous_with.sort_by_key(|peer| peer.event_index);
+    simultaneous_with.dedup_by_key(|peer| peer.event_index);
+
+    let movement_clause = movement_clause
+        .trim_end_matches(" relative to the scene center")
+        .trim();
+    let (shape_label, movement_description) =
+        movement_clause
+            .split_once(" moved ")
+            .ok_or_else(|| TextSemanticsError::ParseLine {
+                line: line.to_string(),
+            })?;
+    let shape_id = parse_shape_label(shape_label).ok_or_else(|| TextSemanticsError::ParseLine {
+        line: line.to_string(),
     })?;
-
-    let (start_point, end_point) =
-        parse_motion_points(body).ok_or_else(|| TextSemanticsError::ParseLine {
-            line: line.to_string(),
-        })?;
-
-    let easing_start = body
-        .find(" frames using ")
-        .map(|index| index + " frames using ".len())
-        .ok_or_else(|| TextSemanticsError::ParseLine {
-            line: line.to_string(),
-        })?;
-    let easing_tail = &body[easing_start..];
-    let easing_end = easing_tail
-        .find(" from (")
-        .or_else(|| easing_tail.find(" while simultaneous with "))
-        .unwrap_or(easing_tail.len());
-    let easing_token = easing_tail[..easing_end].trim();
-    let easing =
-        parse_easing_family(easing_token).ok_or_else(|| TextSemanticsError::ParseEasing {
-            token: easing_token.to_string(),
-        })?;
-
-    let simultaneous_with = parse_simultaneous_with(body);
+    let (start_quadrant, end_quadrant) = parse_movement_description(movement_description, line)?;
 
     Ok(EventSemanticFrame {
         event_index: u32::try_from(event_index).map_err(|_| TextSemanticsError::ParseLine {
             line: line.to_string(),
         })?,
-        shape_id: shape_id.to_string(),
-        start_point,
-        end_point,
-        duration_frames,
-        easing,
+        shape_id,
+        start_point: start_quadrant.center_point(),
+        end_point: end_quadrant.center_point(),
+        duration_frames: 0,
+        easing: EasingFamily::Linear,
         simultaneous_with,
     })
 }
@@ -665,70 +863,58 @@ fn parse_pair_line(line: &str) -> Result<PairSemanticFrame, TextSemanticsError> 
                 line: line.to_string(),
             })?;
 
-    if let Some((shape_part, relation_part)) = relation_body.split_once(" are ") {
-        let (first_shape_id, second_shape_id) =
-            shape_part
-                .split_once(", ")
-                .ok_or_else(|| TextSemanticsError::ParseLine {
-                    line: line.to_string(),
-                })?;
-        let (horizontal_phrase, vertical_phrase) =
-            relation_part
-                .split_once(" and ")
-                .ok_or_else(|| TextSemanticsError::ParseLine {
-                    line: line.to_string(),
-                })?;
-        return Ok(PairSemanticFrame {
-            pair_index,
-            event_index,
-            first_shape_id: first_shape_id.to_string(),
-            second_shape_id: second_shape_id.to_string(),
-            horizontal_relation: HorizontalSemanticRelation::parse(horizontal_phrase).ok_or_else(
-                || TextSemanticsError::ParseRelation {
-                    phrase: horizontal_phrase.to_string(),
-                },
-            )?,
-            vertical_relation: VerticalSemanticRelation::parse(vertical_phrase).ok_or_else(
-                || TextSemanticsError::ParseRelation {
-                    phrase: vertical_phrase.to_string(),
-                },
-            )?,
+    let (subject_part, tail) =
+        relation_body
+            .split_once(" is ")
+            .ok_or_else(|| TextSemanticsError::ParseLine {
+                line: line.to_string(),
+            })?;
+    let (horizontal_relation_segment, vertical_relation_segment) = tail
+        .split_once(" and is ")
+        .ok_or_else(|| TextSemanticsError::ParseLine {
+            line: line.to_string(),
+        })?;
+
+    let (horizontal_phrase, horizontal_object) =
+        split_relation_with_object(horizontal_relation_segment).ok_or_else(|| {
+            TextSemanticsError::ParseLine {
+                line: line.to_string(),
+            }
+        })?;
+    let (vertical_phrase, vertical_object) = split_relation_with_object(vertical_relation_segment)
+        .ok_or_else(|| TextSemanticsError::ParseLine {
+            line: line.to_string(),
+        })?;
+
+    if horizontal_object != vertical_object {
+        return Err(TextSemanticsError::ParseLine {
+            line: line.to_string(),
         });
     }
+    let horizontal_relation = HorizontalSemanticRelation::parse(horizontal_phrase)
+        .or_else(|| HorizontalSemanticRelation::parse(vertical_phrase))
+        .ok_or_else(|| TextSemanticsError::ParseRelation {
+            phrase: horizontal_phrase.to_string(),
+        })?;
+    let vertical_relation = VerticalSemanticRelation::parse(horizontal_phrase)
+        .or_else(|| VerticalSemanticRelation::parse(vertical_phrase))
+        .ok_or_else(|| TextSemanticsError::ParseRelation {
+            phrase: vertical_phrase.to_string(),
+        })?;
 
-    if let Some((subject_part, tail)) = relation_body.split_once(" is ") {
-        let (relation_part, object_part) =
-            tail.split_once(" relative to ")
-                .ok_or_else(|| TextSemanticsError::ParseLine {
-                    line: line.to_string(),
-                })?;
-        let (horizontal_phrase, vertical_phrase) =
-            relation_part
-                .split_once(" and ")
-                .ok_or_else(|| TextSemanticsError::ParseLine {
-                    line: line.to_string(),
-                })?;
-        return Ok(PairSemanticFrame {
-            pair_index,
-            event_index,
-            first_shape_id: subject_part.to_string(),
-            second_shape_id: object_part.to_string(),
-            horizontal_relation: HorizontalSemanticRelation::parse(horizontal_phrase).ok_or_else(
-                || TextSemanticsError::ParseRelation {
-                    phrase: horizontal_phrase.to_string(),
-                },
-            )?,
-            vertical_relation: VerticalSemanticRelation::parse(vertical_phrase).ok_or_else(
-                || TextSemanticsError::ParseRelation {
-                    phrase: vertical_phrase.to_string(),
-                },
-            )?,
-        });
-    }
-
-    Err(TextSemanticsError::ParseLine {
-        line: line.to_string(),
+    Ok(PairSemanticFrame {
+        pair_index,
+        event_index,
+        first_shape_id: subject_part.to_string(),
+        second_shape_id: horizontal_object.to_string(),
+        horizontal_relation,
+        vertical_relation,
     })
+}
+
+fn split_relation_with_object(relation: &str) -> Option<(&str, &str)> {
+    let (phrase, object) = relation.rsplit_once(' ')?;
+    Some((phrase, object))
 }
 
 fn parse_indexed_line_prefix<'a>(
@@ -758,64 +944,80 @@ fn parse_indexed_line_prefix<'a>(
     Ok((index, body))
 }
 
-fn extract_between<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> Option<&'a str> {
-    let start = text.find(start_marker)? + start_marker.len();
-    let tail = &text[start..];
-    let end = tail.find(end_marker)?;
-    Some(&tail[..end])
+fn parse_movement_description(
+    text: &str,
+    line: &str,
+) -> Result<(Quadrant, Quadrant), TextSemanticsError> {
+    if let Some(within) = text.strip_prefix("within ") {
+        let quadrant = within
+            .strip_suffix(" quadrant")
+            .and_then(Quadrant::parse)
+            .ok_or_else(|| TextSemanticsError::ParseLine {
+                line: line.to_string(),
+            })?;
+        return Ok((quadrant, quadrant));
+    }
+
+    let from_to = text
+        .strip_prefix("from ")
+        .ok_or_else(|| TextSemanticsError::ParseLine {
+            line: line.to_string(),
+        })?;
+    let (from_phrase, to_tail) =
+        from_to
+            .split_once(" quadrant to ")
+            .ok_or_else(|| TextSemanticsError::ParseLine {
+                line: line.to_string(),
+            })?;
+    let to_phrase =
+        if let Some((to_phrase, _through_tail)) = to_tail.split_once(" quadrant through ") {
+            to_phrase
+        } else {
+            to_tail
+                .strip_suffix(" quadrant")
+                .ok_or_else(|| TextSemanticsError::ParseLine {
+                    line: line.to_string(),
+                })?
+        };
+    let from_quadrant =
+        Quadrant::parse(from_phrase).ok_or_else(|| TextSemanticsError::ParseLine {
+            line: line.to_string(),
+        })?;
+    let to_quadrant = Quadrant::parse(to_phrase).ok_or_else(|| TextSemanticsError::ParseLine {
+        line: line.to_string(),
+    })?;
+    Ok((from_quadrant, to_quadrant))
 }
 
-fn parse_u16_between(text: &str, start_marker: &str, end_marker: &str) -> Option<u16> {
-    let value = extract_between(text, start_marker, end_marker)?;
-    value.trim().parse::<u16>().ok()
-}
-
-fn parse_motion_points(text: &str) -> Option<(NormalizedPoint, NormalizedPoint)> {
-    let start_x = text.find("from (")? + "from (".len();
-    let tail = &text[start_x..];
-    let (start_point_text, tail) = tail.split_once(") to (")?;
-    let end_point_text = tail.split(')').next()?;
-    let start_point = parse_point(start_point_text)?;
-    let end_point = parse_point(end_point_text)?;
-    Some((start_point, end_point))
-}
-
-fn parse_point(text: &str) -> Option<NormalizedPoint> {
-    let (x_text, y_text) = text.split_once(',')?;
-    let x = x_text.trim().parse::<f64>().ok()?;
-    let y = y_text.trim().parse::<f64>().ok()?;
-    NormalizedPoint::new(x, y).ok()
-}
-
-fn parse_simultaneous_with(text: &str) -> Vec<String> {
-    let Some((_, peers_text)) = text.split_once(" while simultaneous with ") else {
-        return Vec::new();
-    };
-    peers_text
-        .trim_end_matches('.')
-        .split(", ")
+fn parse_simultaneous_clause(
+    text: &str,
+    line: &str,
+) -> Result<Vec<SimultaneousEventRef>, TextSemanticsError> {
+    let peers_text = text.trim().trim_end_matches('.').trim();
+    if peers_text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let normalized = peers_text.replace(", and ", ", ").replace(" and ", ", ");
+    let mut peers = normalized
+        .split(',')
         .filter(|peer| !peer.trim().is_empty())
-        .map(|peer| peer.trim().to_string())
-        .collect()
-}
-
-fn parse_easing_family(token: &str) -> Option<EasingFamily> {
-    match token {
-        "linear" => Some(EasingFamily::Linear),
-        "ease_in" => Some(EasingFamily::EaseIn),
-        "ease_out" => Some(EasingFamily::EaseOut),
-        "ease_in_out" => Some(EasingFamily::EaseInOut),
-        _ => None,
-    }
-}
-
-fn easing_family_name(easing: EasingFamily) -> &'static str {
-    match easing {
-        EasingFamily::Linear => "linear",
-        EasingFamily::EaseIn => "ease_in",
-        EasingFamily::EaseOut => "ease_out",
-        EasingFamily::EaseInOut => "ease_in_out",
-    }
+        .map(|peer| {
+            let peer = peer.trim();
+            let peer =
+                peer.strip_prefix("Event ")
+                    .ok_or_else(|| TextSemanticsError::ParseLine {
+                        line: line.to_string(),
+                    })?;
+            let event_index = peer
+                .parse::<u32>()
+                .map_err(|_| TextSemanticsError::ParseLine {
+                    line: line.to_string(),
+                })?;
+            Ok(SimultaneousEventRef { event_index })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    peers.sort_unstable_by_key(|peer| peer.event_index);
+    Ok(peers)
 }
 
 fn horizontal_relation(
@@ -865,6 +1067,22 @@ mod tests {
         let canonical_lines =
             generate_scene_text_lines_with_alteration(&scene, TextAlterationProfile::Canonical)
                 .expect("canonical line generation should work");
+        for line in &canonical_lines {
+            if line.starts_with("Event ") {
+                assert!(
+                    !line.contains(" over "),
+                    "canonical event line unexpectedly contained duration phrase: {line}"
+                );
+                assert!(
+                    !line.contains(" using "),
+                    "canonical event line unexpectedly contained easing phrase: {line}"
+                );
+                assert!(
+                    line.contains("quadrant"),
+                    "canonical event line should include quadrant wording: {line}"
+                );
+            }
+        }
         let canonical_semantics =
             decode_scene_text_semantics(&canonical_lines).expect("canonical decode should work");
         assert_eq!(canonical_semantics.scene_index, scene.scene_index);

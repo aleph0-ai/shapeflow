@@ -3,15 +3,18 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use export_split::run_export_split;
 use generate::run_generate;
+use human_eval::run_human_eval;
 use inspect_scene::run_inspect_scene;
 use preview::run_preview;
 use shapeflow_core::ShapeFlowConfig;
 use site_stats::run_site_stats;
+use targets::run_targets;
 use validate::{run_validate, run_validate_with_generated_materialization};
 
 mod export_split;
 mod generate;
 mod generated_config_metadata;
+mod human_eval;
 mod inspect_scene;
 mod materialization_metadata;
 mod preview;
@@ -19,6 +22,7 @@ mod site_graph_artifact;
 mod site_metadata;
 mod site_stats;
 mod split_assignments_metadata;
+mod targets;
 mod validate;
 
 #[derive(Debug, Parser)]
@@ -94,6 +98,21 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         samples_per_event: usize,
     },
+    /// Generate deterministic task targets for a single scene without rendering modality artifacts.
+    Targets {
+        /// Path to a ShapeFlow TOML config file.
+        #[arg(long)]
+        config: Utf8PathBuf,
+        /// Scene index to generate targets for.
+        #[arg(long, default_value_t = 0)]
+        scene_index: u32,
+        /// Number of sampled points per motion event used during scene projection.
+        #[arg(long, default_value_t = 24)]
+        samples_per_event: usize,
+        /// Target selector: `all`, exact task id, or task prefix (e.g. `oqp`, `zqh0001`).
+        #[arg(long, default_value = "all")]
+        task_id: String,
+    },
     /// Report site-graph metrics from deterministic recomputation or generated output.
     SiteStats {
         /// Path to a ShapeFlow TOML config file.
@@ -151,6 +170,33 @@ enum Command {
         #[arg(long, default_value_t = false)]
         generated_config: bool,
     },
+    /// Run the human-evaluation web server.
+    HumanEval {
+        /// Address for the HTTP server.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+        /// SQLite database path (CLI-only local/testing mode).
+        #[arg(long)]
+        sqlite_path: Option<String>,
+        /// PostgreSQL connection URL.
+        #[arg(long)]
+        database_url: Option<String>,
+        /// PostgreSQL host (fallback source if --database-url is omitted).
+        #[arg(long)]
+        db_host: Option<String>,
+        /// PostgreSQL port (fallback source if --database-url is omitted).
+        #[arg(long)]
+        db_port: Option<u16>,
+        /// PostgreSQL user (fallback source if --database-url is omitted).
+        #[arg(long)]
+        db_user: Option<String>,
+        /// PostgreSQL password (fallback source if --database-url is omitted).
+        #[arg(long)]
+        db_password: Option<String>,
+        /// PostgreSQL database name (fallback source if --database-url is omitted).
+        #[arg(long)]
+        db_name: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -180,6 +226,12 @@ fn main() -> Result<()> {
             scene_index,
             samples_per_event,
         } => run_preview_command(config, output, scene_index, samples_per_event),
+        Command::Targets {
+            config,
+            scene_index,
+            samples_per_event,
+            task_id,
+        } => run_targets_command(config, scene_index, samples_per_event, task_id),
         Command::SiteStats {
             config,
             generated_output,
@@ -237,6 +289,25 @@ fn main() -> Result<()> {
                 )
             }
         }
+        Command::HumanEval {
+            bind,
+            sqlite_path,
+            database_url,
+            db_host,
+            db_port,
+            db_user,
+            db_password,
+            db_name,
+        } => run_human_eval(
+            bind,
+            sqlite_path,
+            database_url,
+            db_host,
+            db_port,
+            db_user,
+            db_password,
+            db_name,
+        ),
     }
 }
 
@@ -268,6 +339,17 @@ fn run_preview_command(
     let config = load_config(config_path)?;
     config.validate()?;
     run_preview(&config, output_dir.as_ref(), scene_index, samples_per_event)
+}
+
+fn run_targets_command(
+    config_path: Utf8PathBuf,
+    scene_index: u32,
+    samples_per_event: usize,
+    task_id: String,
+) -> Result<()> {
+    let config = load_config(config_path)?;
+    config.validate()?;
+    run_targets(&config, scene_index, samples_per_event, &task_id)
 }
 
 fn run_hash_config(config_path: Utf8PathBuf) -> Result<()> {

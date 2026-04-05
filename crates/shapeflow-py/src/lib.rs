@@ -6,15 +6,15 @@ use pyo3::types::{PyDict, PyList};
 use serde::Serialize;
 use shapeflow_core::config::ConfigError;
 use shapeflow_core::{
-    ArtifactSerializationError, AxisNonlinearityFamily, EasingFamily, ImageArrowType,
-    ImageEncodingError, LatentArtifact, LatentExtractionError, OrderedQuadrantPassageTarget,
+    ArtifactSerializationError, AxisNonlinearityFamily, EasingFamily, GeneratedTarget,
+    ImageArrowType, ImageEncodingError, LatentArtifact, LatentExtractionError,
     SceneGenerationError, SceneGenerationOutput, SceneGenerationParams, SceneProjectionMode,
     SceneSplitAssignment, ShapeFlowConfig, ShapeFlowConfigPreset as CoreShapeFlowConfigPreset,
     SiteGraphValidationError, SoundChannelMapping, SoundEncodingError, SplitAssignmentError,
     SplitAssignmentSummary, TabularEncodingError, TargetArtifact, TargetGenerationError,
     TextEncodingError, TextReferenceFrame, VideoEncodingError, build_split_assignments,
     canonical_scene_id, deserialize_latent_artifact, deserialize_target_artifact,
-    extract_latent_vector_from_scene, generate_ordered_quadrant_passage_targets,
+    extract_latent_vector_from_scene, generate_all_scene_targets,
     generate_scene as core_generate_scene, generate_scene_text_lines_with_scene_config,
     generate_tabular_motion_rows, render_scene_image_png_with_scene_config, render_scene_sound_wav,
     render_scene_video_frames_png_with_keyframe_border, serialize_latent_artifact,
@@ -80,7 +80,9 @@ enum BridgeError {
         "unsupported projection '{projection}'. expected one of: trajectory_only, soft_quadrants"
     )]
     UnsupportedProjection { projection: String },
-    #[error("unsupported task '{task_id}'. currently only 'oqp' is available")]
+    #[error(
+        "unsupported task selector '{task_id}'. use 'all', a task prefix like 'oqp', or an exact task id"
+    )]
     UnsupportedTask { task_id: String },
     #[error("failed to create output directory {path}: {source}")]
     CreateDir {
@@ -195,8 +197,9 @@ impl PyShapeFlowConfig {
     ///     trajectory_complexity: Complexity level for generated trajectories.
     ///     event_duration_frames: Duration of each motion event in frames.
     ///     easing_family: Event interpolation family (`linear|ease_in|ease_out|ease_in_out`).
+    ///     n_motion_slots: Number of motion slots (time slots/panels).
     ///     motion_events_per_shape: Per-shape event counts.
-    ///     n_motion_events_total: Total event count; must equal sum(motion_events_per_shape).
+    ///     n_motion_events_total: Optional cap on total generated shape-motion events.
     ///     allow_simultaneous: Whether multiple shapes may move in the same time slot.
     ///     sound_sample_rate_hz: Output WAV sample rate.
     ///     sound_frames_per_second: Temporal sampling rate for sound encoding.
@@ -226,6 +229,7 @@ impl PyShapeFlowConfig {
         trajectory_complexity,
         event_duration_frames,
         easing_family,
+        n_motion_slots,
         motion_events_per_shape,
         n_motion_events_total,
         allow_simultaneous,
@@ -256,8 +260,9 @@ impl PyShapeFlowConfig {
         trajectory_complexity: u8,
         event_duration_frames: u16,
         easing_family: &str,
+        n_motion_slots: u32,
         motion_events_per_shape: Vec<u16>,
-        n_motion_events_total: u32,
+        n_motion_events_total: Option<u32>,
         allow_simultaneous: bool,
         sound_sample_rate_hz: u32,
         sound_frames_per_second: u16,
@@ -285,6 +290,7 @@ impl PyShapeFlowConfig {
         config.scene.trajectory_complexity = trajectory_complexity;
         config.scene.event_duration_frames = event_duration_frames;
         config.scene.easing_family = parse_easing_family(easing_family)?;
+        config.scene.n_motion_slots = n_motion_slots;
         config.scene.motion_events_per_shape = motion_events_per_shape;
         config.scene.n_motion_events_total = n_motion_events_total;
         config.scene.allow_simultaneous = allow_simultaneous;
@@ -328,8 +334,9 @@ impl PyShapeFlowConfig {
     ///     trajectory_complexity: Trajectory complexity level.
     ///     event_duration_frames: Duration of each event in frames.
     ///     easing_family: Event interpolation family.
+    ///     n_motion_slots: Number of motion slots (time slots/panels).
     ///     motion_events_per_shape: Per-shape event counts.
-    ///     n_motion_events_total: Total event count.
+    ///     n_motion_events_total: Optional cap on total generated shape-motion events.
     ///     allow_simultaneous: Whether simultaneous motion is enabled.
     ///     sound_sample_rate_hz: Output WAV sample rate.
     ///     sound_frames_per_second: Temporal sampling rate for sound encoding.
@@ -357,6 +364,7 @@ impl PyShapeFlowConfig {
         trajectory_complexity,
         event_duration_frames,
         easing_family,
+        n_motion_slots,
         motion_events_per_shape,
         n_motion_events_total,
         allow_simultaneous,
@@ -381,8 +389,9 @@ impl PyShapeFlowConfig {
         trajectory_complexity: u8,
         event_duration_frames: u16,
         easing_family: &str,
+        n_motion_slots: u32,
         motion_events_per_shape: Vec<u16>,
-        n_motion_events_total: u32,
+        n_motion_events_total: Option<u32>,
         allow_simultaneous: bool,
         sound_sample_rate_hz: u32,
         sound_frames_per_second: u16,
@@ -405,6 +414,7 @@ impl PyShapeFlowConfig {
             trajectory_complexity,
             event_duration_frames,
             easing_family,
+            n_motion_slots,
             motion_events_per_shape,
             n_motion_events_total,
             allow_simultaneous,
@@ -658,7 +668,6 @@ impl PyShapeFlowConfig {
                 .motion_events_per_shape
                 .resize(target_shapes, last);
             config.scene.n_shapes = n_shapes;
-            recompute_scene_motion_events_total(config);
         })
     }
 
@@ -691,10 +700,18 @@ impl PyShapeFlowConfig {
         Ok(list.into_any().unbind())
     }
 
+    fn scene_n_motion_slots(&self) -> u32 {
+        self.config.scene.n_motion_slots
+    }
+
+    fn set_scene_n_motion_slots(&mut self, slots: u32) -> PyResult<()> {
+        self.apply_with_validation(|config| config.scene.n_motion_slots = slots)
+    }
+
     /// Set full per-shape event-count vector.
     ///
     /// Args:
-    ///     events: Per-shape event counts; also updates shape count and total count.
+    ///     events: Per-shape event counts; also updates shape count.
     fn set_scene_motion_events_per_shape(&mut self, events: Vec<u16>) -> PyResult<()> {
         let n_shapes = u8::try_from(events.len()).map_err(|_| {
             PyValueError::new_err("scene.motion_events_per_shape must contain at most 255 entries")
@@ -703,12 +720,15 @@ impl PyShapeFlowConfig {
         self.apply_with_validation(move |config| {
             config.scene.motion_events_per_shape = events;
             config.scene.n_shapes = n_shapes;
-            recompute_scene_motion_events_total(config);
         })
     }
 
-    fn scene_n_motion_events_total(&self) -> u32 {
+    fn scene_n_motion_events_total(&self) -> Option<u32> {
         self.config.scene.n_motion_events_total
+    }
+
+    fn set_scene_n_motion_events_total(&mut self, total_cap: Option<u32>) -> PyResult<()> {
+        self.apply_with_validation(|config| config.scene.n_motion_events_total = total_cap)
     }
 
     fn scene_allow_simultaneous(&self) -> bool {
@@ -1130,16 +1150,6 @@ fn parse_image_arrow_type(token: &str) -> PyResult<ImageArrowType> {
     }
 }
 
-fn recompute_scene_motion_events_total(config: &mut ShapeFlowConfig) {
-    config.scene.n_motion_events_total = config
-        .scene
-        .motion_events_per_shape
-        .iter()
-        .copied()
-        .map(u32::from)
-        .sum();
-}
-
 #[pymethods]
 impl ShapeFlowBridge {
     #[new]
@@ -1260,7 +1270,7 @@ impl ShapeFlowBridge {
     ///
     /// Args:
     ///     index: Scene index.
-    ///     task_id: Task identifier (currently only `oqp`).
+    ///     task_id: Task selector (`all`, exact task id, or task prefix like `oqp`).
     ///     samples_per_event: Trajectory samples per event (>0).
     fn load_targets(
         &self,
@@ -1454,7 +1464,7 @@ fn iter_scenes(
 /// Args:
 ///     config_path: Filesystem path to config TOML.
 ///     index: Scene index.
-///     task_id: Task identifier (currently only `oqp`).
+///     task_id: Task selector (`all`, exact task id, or task prefix like `oqp`).
 ///     samples_per_event: Trajectory samples per event (>0).
 fn load_targets(
     py: Python<'_>,
@@ -1589,21 +1599,29 @@ fn generate_targets_for_task(
     scene_index: u64,
     samples_per_event: usize,
     task_id: &str,
-) -> Result<Vec<OrderedQuadrantPassageTarget>, BridgeError> {
-    if task_id != "oqp" {
-        return Err(BridgeError::UnsupportedTask {
-            task_id: task_id.to_owned(),
-        });
-    }
-
+) -> Result<Vec<GeneratedTarget>, BridgeError> {
     let scene = generate_scene_from_config(
         config,
         scene_index,
         samples_per_event,
         SceneProjectionMode::SoftQuadrants,
     )?;
-    let targets = generate_ordered_quadrant_passage_targets(&scene)?;
-    Ok(targets)
+    let mut targets = generate_all_scene_targets(&scene)?;
+    targets.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    if task_id == "all" {
+        return Ok(targets);
+    }
+
+    let filtered = targets
+        .into_iter()
+        .filter(|target| target.task_id == task_id || target.task_id.starts_with(task_id))
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Err(BridgeError::UnsupportedTask {
+            task_id: task_id.to_owned(),
+        });
+    }
+    Ok(filtered)
 }
 
 fn materialize_dataset_from_config(
@@ -1814,10 +1832,10 @@ fn materialize_dataset_from_config(
             video_frame_file_count += 1;
         }
 
-        let mut targets = generate_ordered_quadrant_passage_targets(&output)?;
-        targets.sort_by_key(|target| target.shape_index);
+        let mut targets = generate_all_scene_targets(&output)?;
+        targets.sort_by(|left, right| left.task_id.cmp(&right.task_id));
         for target in targets {
-            let task_id = format!("oqp{:04}", target.shape_index);
+            let task_id = target.task_id;
             let target_artifact = TargetArtifact {
                 schema_version: config.schema_version,
                 scene_id: scene_id.clone(),
@@ -1991,14 +2009,14 @@ fn scene_output_to_py(py: Python<'_>, output: &SceneGenerationOutput) -> PyResul
     Ok(scene_dict.into_any().unbind())
 }
 
-fn targets_to_py(py: Python<'_>, targets: &[OrderedQuadrantPassageTarget]) -> PyResult<Py<PyAny>> {
+fn targets_to_py(py: Python<'_>, targets: &[GeneratedTarget]) -> PyResult<Py<PyAny>> {
     let target_list = PyList::empty(py);
     for target in targets {
         let target_dict = PyDict::new(py);
-        target_dict.set_item("shape_index", target.shape_index)?;
+        target_dict.set_item("task_id", &target.task_id)?;
         let segments = PyList::empty(py);
         for segment in &target.segments {
-            segments.append((segment.q1, segment.q2, segment.q3, segment.q4))?;
+            segments.append(PyList::new(py, segment.iter().copied())?)?;
         }
         target_dict.set_item("segments", segments)?;
         target_list.append(target_dict)?;
@@ -2045,8 +2063,9 @@ mod tests {
             2,
             24,
             "ease_in_out",
-            vec![3, 3],
             6,
+            vec![3, 3],
+            Some(6),
             true,
             44_100,
             24,
@@ -2388,8 +2407,10 @@ mod tests {
             projection: SceneProjectionMode::SoftQuadrants,
         })
         .expect("core scene generation should succeed");
-        let core_targets = generate_ordered_quadrant_passage_targets(&core_scene)
-            .expect("core targets should generate");
+        let mut core_targets =
+            generate_all_scene_targets(&core_scene).expect("core targets should generate");
+        core_targets.retain(|target| target.task_id.starts_with("oqp"));
+        core_targets.sort_by(|left, right| left.task_id.cmp(&right.task_id));
 
         assert_eq!(bridge_targets, core_targets);
     }
@@ -2510,10 +2531,11 @@ mod tests {
         assert_eq!(text_count, scene_count);
         assert_eq!(image_count, scene_count);
         assert_eq!(sound_count, scene_count);
-        assert_eq!(
-            target_count,
-            scene_count * usize::from(bootstrap_config().scene.n_shapes)
-        );
+        let per_scene_target_count = shapeflow_core::expected_target_task_ids(usize::from(
+            bootstrap_config().scene.n_shapes,
+        ))
+        .len();
+        assert_eq!(target_count, scene_count * per_scene_target_count);
 
         std::fs::remove_dir_all(output_path).expect("output dir should be removable");
     }
@@ -2595,10 +2617,13 @@ mod tests {
         let mut config = config_with_defaults(11);
         Python::attach(|py| {
             config
+                .set_scene_n_motion_events_total(None)
+                .expect("set_scene_n_motion_events_total should succeed");
+            config
                 .set_scene_motion_events_per_shape(vec![1, 2, 4])
                 .expect("set_scene_motion_events_per_shape should succeed");
             assert_eq!(config.scene_n_shapes(), 3);
-            assert_eq!(config.scene_n_motion_events_total(), 7);
+            assert_eq!(config.scene_n_motion_events_total(), None);
             let events = config
                 .scene_motion_events_per_shape(py)
                 .expect("scene_motion_events_per_shape should be exposed");

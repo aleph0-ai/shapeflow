@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use shapeflow_core::{
     LatentArtifact, SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig, TargetArtifact,
     build_split_assignments, canonical_scene_id, deserialize_latent_artifact,
-    extract_latent_vector_from_scene, generate_ordered_quadrant_passage_targets, generate_scene,
+    extract_latent_vector_from_scene, generate_all_scene_targets, generate_scene,
     generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
     render_scene_image_png_with_scene_config, render_scene_sound_wav,
     render_scene_video_frames_png_with_keyframe_border, serialize_latent_artifact,
@@ -84,13 +84,13 @@ fn build_scene_materialization(
     )
     .with_context(|| format!("sound rendering failed for scene_index={scene_index}"))?;
 
-    let mut targets = generate_ordered_quadrant_passage_targets(&output)
+    let mut targets = generate_all_scene_targets(&output)
         .with_context(|| format!("target generation failed for scene_index={scene_index}"))?;
-    targets.sort_by_key(|target| target.shape_index);
+    targets.sort_by(|left, right| left.task_id.cmp(&right.task_id));
     let target_artifacts = targets
         .into_iter()
         .map(|target| {
-            let task_id = format!("oqp{:04}", target.shape_index);
+            let task_id = target.task_id;
             let artifact = TargetArtifact {
                 schema_version: config.schema_version,
                 scene_id: scene_id.clone(),
@@ -98,10 +98,7 @@ fn build_scene_materialization(
                 segments: target.segments,
             };
             let bytes = serialize_target_artifact(&artifact).with_context(|| {
-                format!(
-                    "target artifact serialization failed for scene_index={scene_index}, shape_index={}",
-                    target.shape_index
-                )
+                format!("target artifact serialization failed for scene_index={scene_index}, task_id={task_id}")
             })?;
             Ok((task_id, bytes, artifact.segments.len()))
         })

@@ -5,8 +5,8 @@ use crate::split_assignments_metadata::SplitAssignmentsMetadataRecord;
 use shapeflow_core::{
     LatentArtifact, SceneGenerationParams, SceneProjectionMode, TargetArtifact, canonical_scene_id,
     deserialize_latent_artifact, deserialize_site_graph_artifact, deserialize_target_artifact,
-    extract_latent_vector_from_scene, generate_ordered_quadrant_passage_targets, generate_scene,
-    generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
+    expected_target_task_ids, extract_latent_vector_from_scene, generate_all_scene_targets,
+    generate_scene, generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
     render_scene_image_png_with_scene_config, render_scene_sound_wav,
     render_scene_video_frames_png_with_keyframe_border, serialize_latent_artifact,
     serialize_scene_text, serialize_site_graph_artifact, serialize_tabular_motion_rows_csv,
@@ -1392,20 +1392,9 @@ fn generate_smoke_bootstrap_config() {
         usize::try_from(scene_count).unwrap_or(0),
         "image_file_count should equal scene_count"
     );
-    let expected_video_frames_per_scene = if output_config.scene.allow_simultaneous {
-        output_config
-            .scene
-            .motion_events_per_shape
-            .iter()
-            .copied()
-            .max()
-            .map(usize::from)
-            .unwrap_or(0)
-            * usize::from(output_config.scene.event_duration_frames)
-    } else {
-        usize::try_from(output_config.scene.n_motion_events_total).unwrap_or(0)
-            * usize::from(output_config.scene.event_duration_frames)
-    };
+    let expected_video_frames_per_scene = usize::try_from(output_config.scene.n_motion_slots)
+        .unwrap_or(0)
+        * usize::from(output_config.scene.event_duration_frames);
     let expected_video_frame_total =
         usize::try_from(scene_count).unwrap_or(0) * expected_video_frames_per_scene;
     let video_frame_file_count_metadata = materialization_value
@@ -1425,8 +1414,9 @@ fn generate_smoke_bootstrap_config() {
         .count();
     assert_eq!(
         target_file_count,
-        usize::try_from(scene_count).unwrap_or(0) * usize::from(output_config.scene.n_shapes),
-        "bootstrap config with scene_count scenes should write scene_count * config.scene.n_shapes target files"
+        usize::try_from(scene_count).unwrap_or(0)
+            * expected_target_task_ids(usize::from(output_config.scene.n_shapes)).len(),
+        "bootstrap config with scene_count scenes should write all target files per scene"
     );
 
     let latent_file_count = std::fs::read_dir(output_path.join("latent").as_std_path())
@@ -1662,16 +1652,15 @@ fn generate_smoke_bootstrap_config_matches_core_artifacts() {
             );
         }
 
-        let mut targets =
-            generate_ordered_quadrant_passage_targets(&output).expect("targets should generate");
-        targets.sort_by_key(|target| target.shape_index);
+        let mut targets = generate_all_scene_targets(&output).expect("targets should generate");
+        targets.sort_by(|left, right| left.task_id.cmp(&right.task_id));
         for target in targets {
-            let task_id = format!("oqp{:04}", target.shape_index);
+            let task_id = target.task_id.clone();
             let expected_target = TargetArtifact {
                 schema_version: output_config.schema_version,
                 scene_id: scene_id.clone(),
                 task_id: task_id.clone(),
-                segments: target.segments.clone(),
+                segments: target.segments,
             };
             let expected_target_bytes = serialize_target_artifact(&expected_target)
                 .expect("target artifact serialization should succeed");
@@ -1859,8 +1848,7 @@ fn generate_bootstrap_config_is_deterministic() {
             );
         }
 
-        for shape_index in 0..n_shapes {
-            let task_id = format!("oqp{:04}", shape_index);
+        for task_id in expected_target_task_ids(usize::try_from(n_shapes).unwrap_or(0)) {
             let target_filename = format!("{scene_id}_{task_id}.sft");
             let target_path_1 = output_path_1.join("targets").join(&target_filename);
             let target_path_2 = output_path_2.join("targets").join(&target_filename);

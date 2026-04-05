@@ -54,12 +54,16 @@ pub use split_assignments::{
     SplitBucket, build_split_assignments,
 };
 pub use tabular_encoding::{
-    ShapeIdentity, TabularEncodingError, TabularMotionRow, canonical_scene_id,
+    ShapeIdentity, TabularEncodingError, TabularMotionRow, canonical_class_count,
+    canonical_class_rank_for_scene_seed, canonical_class_value_for_scene_seed, canonical_scene_id,
     generate_tabular_motion_rows, serialize_tabular_motion_rows_csv, shape_identity_for_index,
 };
 pub use target_generation::{
-    OrderedQuadrantPassageTarget, TargetGenerationError, TargetValidationReport,
-    generate_ordered_quadrant_passage_targets, validate_ordered_quadrant_passage_targets,
+    GeneratedTarget, GeneratedTargetValidationReport, OrderedQuadrantPassageTarget,
+    SceneTargetGenerationError, TargetGenerationError, TargetValidationReport,
+    expected_target_task_ids, generate_all_scene_targets,
+    generate_ordered_quadrant_passage_targets, generate_scene_targets_for_index,
+    validate_generated_targets, validate_ordered_quadrant_passage_targets,
 };
 pub use text_encoding::{
     TextEncodingError, generate_scene_text_lines, generate_scene_text_lines_with_scene_config,

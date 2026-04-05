@@ -43,8 +43,9 @@ class ShapeFlowConfig:
         trajectory_complexity: int,
         event_duration_frames: int,
         easing_family: EasingFamily,
+        n_motion_slots: int,
         motion_events_per_shape: list[int],
-        n_motion_events_total: int,
+        n_motion_events_total: int | None,
         allow_simultaneous: bool,
         sound_sample_rate_hz: int,
         sound_frames_per_second: int,
@@ -75,8 +76,9 @@ class ShapeFlowConfig:
             trajectory_complexity: Trajectory complexity level.
             event_duration_frames: Duration of each motion event in frames.
             easing_family: Event interpolation family.
+            n_motion_slots: Number of motion slots (timeline/comic-strip panels).
             motion_events_per_shape: Per-shape event counts.
-            n_motion_events_total: Must equal sum(motion_events_per_shape).
+            n_motion_events_total: Optional cap on total generated shape-motion events.
             allow_simultaneous: Whether shapes may move in shared time slots.
             sound_sample_rate_hz: Output WAV sample rate.
             sound_frames_per_second: Temporal sampling for sound encoding.
@@ -108,8 +110,9 @@ class ShapeFlowConfig:
         trajectory_complexity: int,
         event_duration_frames: int,
         easing_family: EasingFamily,
+        n_motion_slots: int,
         motion_events_per_shape: list[int],
-        n_motion_events_total: int,
+        n_motion_events_total: int | None,
         allow_simultaneous: bool,
         sound_sample_rate_hz: int,
         sound_frames_per_second: int,
@@ -234,9 +237,12 @@ class ShapeFlowConfig:
     def set_scene_trajectory_complexity(self, complexity: int) -> None: ...
     def scene_event_duration_frames(self) -> int: ...
     def set_scene_event_duration_frames(self, frames: int) -> None: ...
+    def scene_n_motion_slots(self) -> int: ...
+    def set_scene_n_motion_slots(self, slots: int) -> None: ...
     def scene_motion_events_per_shape(self) -> list[int]: ...
     def set_scene_motion_events_per_shape(self, events: list[int]) -> None: ...
-    def scene_n_motion_events_total(self) -> int: ...
+    def scene_n_motion_events_total(self) -> int | None: ...
+    def set_scene_n_motion_events_total(self, total_cap: int | None) -> None: ...
     def scene_allow_simultaneous(self) -> bool: ...
     def set_scene_allow_simultaneous(self, allow: bool) -> None: ...
     def scene_sound_sample_rate_hz(self) -> int: ...

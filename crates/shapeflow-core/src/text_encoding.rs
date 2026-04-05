@@ -62,8 +62,9 @@ mod tests {
         SceneShapePath, generate_scene,
     };
     use crate::seed_schedule::SceneSeedSchedule;
+    use crate::tabular_encoding::shape_identity_for_scene;
     use crate::text_semantics::{TextAlterationProfile, derive_scene_text_semantics};
-    use crate::{NormalizedPoint, ShapeFlowConfig, shape_identity_for_index};
+    use crate::{NormalizedPoint, ShapeFlowConfig};
 
     fn bootstrap_config() -> ShapeFlowConfig {
         toml::from_str(include_str!("../../../configs/bootstrap.toml"))
@@ -110,14 +111,99 @@ mod tests {
         SceneGenerationOutput {
             scene_index: 0,
             schedule: SceneSeedSchedule::derive(7, 0),
+            shape_identity_assignment: crate::config::ShapeIdentityAssignment::IndexLocked,
             shape_paths,
             motion_events,
             accounting: MotionEventAccounting {
                 expected_total: total_events,
+                expected_slots: total_events,
                 generated_total: total_events,
                 expected_per_shape: per_shape_events.clone(),
                 generated_per_shape: per_shape_events,
             },
+        }
+    }
+
+    fn synthetic_simultaneous_pair_scene() -> SceneGenerationOutput {
+        let shape_paths = vec![
+            SceneShapePath {
+                shape_index: 0,
+                trajectory_points: vec![
+                    NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+                    NormalizedPoint::new(0.2, 0.0).expect("point must build"),
+                ],
+                soft_memberships: None,
+            },
+            SceneShapePath {
+                shape_index: 1,
+                trajectory_points: vec![
+                    NormalizedPoint::new(0.1, -0.2).expect("point must build"),
+                    NormalizedPoint::new(0.3, 0.2).expect("point must build"),
+                ],
+                soft_memberships: None,
+            },
+        ];
+
+        let motion_events = vec![
+            MotionEvent {
+                global_event_index: 0,
+                time_slot: 0,
+                shape_index: 0,
+                shape_event_index: 0,
+                start_point: NormalizedPoint::new(0.0, 0.0).expect("point must build"),
+                end_point: NormalizedPoint::new(0.1, 0.1).expect("point must build"),
+                duration_frames: 24,
+                easing: crate::config::EasingFamily::Linear,
+            },
+            MotionEvent {
+                global_event_index: 1,
+                time_slot: 0,
+                shape_index: 1,
+                shape_event_index: 0,
+                start_point: NormalizedPoint::new(0.1, -0.2).expect("point must build"),
+                end_point: NormalizedPoint::new(0.2, 0.0).expect("point must build"),
+                duration_frames: 24,
+                easing: crate::config::EasingFamily::Linear,
+            },
+        ];
+
+        SceneGenerationOutput {
+            scene_index: 0,
+            schedule: SceneSeedSchedule::derive(7, 0),
+            shape_identity_assignment: crate::config::ShapeIdentityAssignment::IndexLocked,
+            shape_paths,
+            motion_events,
+            accounting: MotionEventAccounting {
+                expected_total: 2,
+                expected_slots: 2,
+                generated_total: 2,
+                expected_per_shape: vec![1, 1],
+                generated_per_shape: vec![1, 1],
+            },
+        }
+    }
+
+    fn assert_event_metadata_equivalent(
+        decoded: &[crate::EventSemanticFrame],
+        derived: &[crate::EventSemanticFrame],
+    ) {
+        assert_eq!(decoded.len(), derived.len());
+        for (decoded_event, derived_event) in decoded.iter().zip(derived.iter()) {
+            assert_eq!(decoded_event.event_index, derived_event.event_index);
+            assert_eq!(decoded_event.shape_id, derived_event.shape_id);
+            let mut decoded_simultaneous = decoded_event
+                .simultaneous_with
+                .iter()
+                .map(|peer| peer.event_index)
+                .collect::<Vec<_>>();
+            decoded_simultaneous.sort_unstable();
+            let mut derived_simultaneous = derived_event
+                .simultaneous_with
+                .iter()
+                .map(|peer| peer.event_index)
+                .collect::<Vec<_>>();
+            derived_simultaneous.sort_unstable();
+            assert_eq!(decoded_simultaneous, derived_simultaneous);
         }
     }
 
@@ -143,7 +229,13 @@ mod tests {
 
     #[test]
     fn text_mentions_simultaneous_shapes_for_shared_time_slots() {
-        let config = bootstrap_config();
+        let mut config = bootstrap_config();
+        config.scene.allow_simultaneous = true;
+        config.scene.randomize_motion_events_per_shape = false;
+        config.scene.motion_events_per_shape_random_ranges = None;
+        config.scene.n_motion_slots = 12;
+        config.scene.motion_events_per_shape = vec![4, 4, 4];
+        config.scene.n_motion_events_total = Some(12);
         let params = SceneGenerationParams {
             config: &config,
             scene_index: 0,
@@ -154,11 +246,156 @@ mod tests {
         let lines = generate_scene_text_lines(&scene).expect("text generation should work");
 
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("while simultaneous with")),
+            lines.iter().any(|line| line.contains("same time as Event")),
             "bootstrap fixture should include at least one simultaneous event phrase"
         );
+    }
+
+    #[test]
+    fn canonical_text_lines_roundtrip_and_layout() {
+        let scene = synthetic_scene(4, 2);
+        let lines = generate_scene_text_lines(&scene).expect("text generation should work");
+        let decoded = decode_scene_text_semantics(&lines).expect("canonical lines should decode");
+        let expected =
+            derive_scene_text_semantics(&scene).expect("semantic derivation should work");
+        assert_eq!(decoded.scene_index, expected.scene_index);
+        assert_event_metadata_equivalent(&decoded.events, &expected.events);
+        assert_eq!(decoded.pairs, expected.pairs);
+
+        assert_eq!(
+            lines.len(),
+            1 + expected.events.len() + expected.pairs.len(),
+            "line count should match event and pair line total"
+        );
+
+        let event_start = 1;
+        for (offset, event) in expected.events.iter().enumerate() {
+            assert!(
+                lines[event_start + offset]
+                    .starts_with(&format!("Event {:04}:", event.event_index)),
+                "event line {} missing expected prefix",
+                event.event_index
+            );
+            assert!(
+                !lines[event_start + offset].contains(" over "),
+                "event line {} unexpectedly contained duration phrase",
+                event.event_index
+            );
+            assert!(
+                !lines[event_start + offset].contains(" using "),
+                "event line {} unexpectedly contained easing phrase",
+                event.event_index
+            );
+            assert!(
+                lines[event_start + offset].contains("quadrant"),
+                "event line {} should include quadrant wording",
+                event.event_index
+            );
+        }
+
+        let pair_start = 1 + expected.events.len();
+        for pair in &expected.pairs {
+            assert!(
+                lines[pair_start + pair.pair_index]
+                    .contains(&format!("Pair {:04}:", pair.pair_index)),
+                "pair line {} missing pair marker",
+                pair.pair_index
+            );
+            assert!(
+                lines[pair_start + pair.pair_index]
+                    .contains(&format!("[event {:04}]", pair.event_index)),
+                "pair line {} missing event marker",
+                pair.pair_index
+            );
+            assert!(
+                lines[pair_start + pair.pair_index].contains(&pair.first_shape_id),
+                "pair line {} missing first shape id",
+                pair.pair_index
+            );
+            assert!(
+                lines[pair_start + pair.pair_index].contains(&pair.second_shape_id),
+                "pair line {} missing second shape id",
+                pair.pair_index
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_lines_use_explicit_simultaneous_event_context() {
+        let scene = synthetic_simultaneous_pair_scene();
+        let lines = generate_scene_text_lines(&scene).expect("text generation should work");
+        let semantics =
+            derive_scene_text_semantics(&scene).expect("semantic derivation should work");
+
+        let mut saw_simultaneous = false;
+        for event in &semantics.events {
+            let marker = format!("Event {:04}:", event.event_index);
+            let event_line = lines
+                .iter()
+                .find(|line| line.starts_with(&marker))
+                .expect("event line should be present");
+            if event.simultaneous_with.is_empty() {
+                continue;
+            }
+            saw_simultaneous = true;
+            assert!(
+                event_line.contains("same time as Event"),
+                "event {} line missing simultaneous context",
+                event.event_index
+            );
+            let mut ids = event
+                .simultaneous_with
+                .iter()
+                .map(|peer| format!("{:04}", peer.event_index))
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            for id in ids {
+                assert!(
+                    event_line.contains(&format!("Event {id}")),
+                    "event {} line missing simultaneous event id {}",
+                    event.event_index,
+                    id
+                );
+            }
+        }
+        assert!(
+            saw_simultaneous,
+            "expected at least one simultaneous event in fixture"
+        );
+    }
+
+    #[test]
+    fn canonical_pair_lines_include_explicit_reference_shape_in_relations() {
+        let scene = synthetic_scene(3, 1);
+        let lines = generate_scene_text_lines(&scene).expect("text generation should work");
+        let semantics =
+            derive_scene_text_semantics(&scene).expect("semantic derivation should work");
+
+        let pair_start = 1 + semantics.events.len();
+        for pair in &semantics.pairs {
+            let line = &lines[pair_start + pair.pair_index];
+            let marker = format!(
+                "Pair {:04}: [event {:04}] ",
+                pair.pair_index, pair.event_index
+            );
+            assert!(line.starts_with(&marker));
+            assert!(
+                line.contains(&format!("{} is ", pair.first_shape_id)),
+                "pair line {} missing first shape as subject",
+                pair.pair_index
+            );
+            assert!(
+                line.contains(" and is "),
+                "pair line {} missing two explicit relation clauses",
+                pair.pair_index
+            );
+            let second_id_count = line.matches(&pair.second_shape_id).count();
+            assert!(
+                second_id_count >= 2,
+                "pair {} line should mention second shape in both relation clauses",
+                pair.pair_index
+            );
+        }
     }
 
     #[test]
@@ -187,7 +424,7 @@ mod tests {
 
                 let identities: Vec<_> = (0..shape_count)
                     .map(|shape_index| {
-                        shape_identity_for_index(shape_index)
+                        shape_identity_for_scene(&scene, shape_index)
                             .expect("identity must resolve")
                             .shape_id
                     })
@@ -409,6 +646,7 @@ mod tests {
         let scene = SceneGenerationOutput {
             scene_index: 0,
             schedule: SceneSeedSchedule::derive(1, 0),
+            shape_identity_assignment: crate::config::ShapeIdentityAssignment::IndexLocked,
             shape_paths: vec![SceneShapePath {
                 shape_index: 0,
                 trajectory_points: vec![NormalizedPoint::new(0.0, 0.0).expect("point must build")],
@@ -426,6 +664,7 @@ mod tests {
             }],
             accounting: MotionEventAccounting {
                 expected_total: 1,
+                expected_slots: 1,
                 generated_total: 1,
                 expected_per_shape: vec![1],
                 generated_per_shape: vec![1],
@@ -450,6 +689,7 @@ mod tests {
         let scene = SceneGenerationOutput {
             scene_index: 0,
             schedule: SceneSeedSchedule::derive(1, 0),
+            shape_identity_assignment: crate::config::ShapeIdentityAssignment::IndexLocked,
             shape_paths: vec![
                 SceneShapePath {
                     shape_index: 0,
@@ -476,6 +716,7 @@ mod tests {
             }],
             accounting: MotionEventAccounting {
                 expected_total: 1,
+                expected_slots: 1,
                 generated_total: 1,
                 expected_per_shape: vec![1, 0],
                 generated_per_shape: vec![1, 0],
@@ -487,7 +728,10 @@ mod tests {
                 shape_id,
                 shape_index,
             } => {
-                assert_eq!(shape_id, "circle_red");
+                let expected_shape_id = shape_identity_for_scene(&scene, 0)
+                    .expect("shape identity should resolve")
+                    .shape_id;
+                assert_eq!(shape_id, expected_shape_id);
                 assert_eq!(shape_index, 0);
             }
             other => panic!("unexpected error variant: {other:?}"),

@@ -3,9 +3,12 @@ use std::io::Cursor;
 
 use crate::config::{EasingFamily, SoundChannelMapping};
 use crate::scene_generation::SceneGenerationOutput;
+use crate::tabular_encoding::{
+    canonical_class_count, canonical_class_rank_for_shape_type_and_color,
+    shape_type_and_color_indices_for_scene_seed,
+};
+use libm::{pow, sin};
 
-const COLOR_PALETTE_SIZE: usize = 8;
-const SHAPE_TYPE_PALETTE_SIZE: usize = 5;
 const PULSE_DUTY_CYCLE: f64 = 0.25;
 
 #[derive(Clone, Copy)]
@@ -32,6 +35,8 @@ pub enum SoundEncodingError {
         shape_index: usize,
         shape_count: usize,
     },
+    #[error("scene contains no motion events")]
+    NoMotionEvents,
     #[error("motion event {global_event_index} has zero duration")]
     ZeroEventDuration { global_event_index: u32 },
     #[error(
@@ -66,22 +71,40 @@ pub fn render_scene_sound_wav(
         });
     }
     if scene.motion_events.is_empty() {
-        return Ok(Vec::new());
+        return Err(SoundEncodingError::NoMotionEvents);
     }
 
     let shape_count = scene.shape_paths.len();
-    let max_time_slot = scene
+    let mut shape_profiles = Vec::with_capacity(shape_count);
+    for shape_index in 0..shape_count {
+        let (shape_type_index, color_index) = match shape_type_and_color_indices_for_scene_seed(
+            scene.schedule.scene_layout,
+            scene.shape_identity_assignment,
+            shape_index,
+        ) {
+            Ok(indices) => indices,
+            Err(error) => {
+                return Err(SoundEncodingError::WavEncoding(error.to_string()));
+            }
+        };
+        let canonical_rank =
+            canonical_class_rank_for_shape_type_and_color(shape_type_index, color_index)
+                .map_err(|error| SoundEncodingError::WavEncoding(error.to_string()))?;
+        shape_profiles.push((
+            base_frequency_for_canonical_rank(usize::from(canonical_rank)),
+            waveform_for_shape_type(shape_type_index),
+        ));
+    }
+    let default_duration_frames = scene
         .motion_events
         .iter()
-        .map(|event| event.time_slot)
-        .max()
-        .unwrap_or(0);
-    let mut events_by_slot = vec![
-        Vec::new();
-        usize::try_from(max_time_slot).map_err(|_| {
-            SoundEncodingError::WavEncoding("time slot index exceeds platform limits".to_string())
-        })? + 1
-    ];
+        .min_by_key(|event| event.time_slot)
+        .map(|event| event.duration_frames)
+        .ok_or(SoundEncodingError::NoMotionEvents)?;
+    let slot_count = usize::try_from(scene.accounting.expected_slots).map_err(|_| {
+        SoundEncodingError::WavEncoding("time slot count exceeds platform limits".to_string())
+    })?;
+    let mut events_by_slot = vec![Vec::new(); slot_count];
 
     for event in &scene.motion_events {
         if event.shape_index >= shape_count {
@@ -110,21 +133,23 @@ pub fn render_scene_sound_wav(
         SoundChannelMapping::StereoAlternating => 2,
     };
     for (slot_index, slot_events) in events_by_slot.iter_mut().enumerate() {
-        if slot_events.is_empty() {
-            continue;
-        }
-        slot_events.sort_by_key(|event| event.global_event_index);
-        let expected_duration_frames = slot_events[0].duration_frames;
-        for event in slot_events.iter().skip(1) {
-            if event.duration_frames != expected_duration_frames {
-                return Err(SoundEncodingError::MismatchedSlotDuration {
-                    time_slot: slot_index as u32,
-                    expected: expected_duration_frames,
-                    found: event.duration_frames,
-                    global_event_index: event.global_event_index,
-                });
+        let expected_duration_frames = if slot_events.is_empty() {
+            default_duration_frames
+        } else {
+            slot_events.sort_by_key(|event| event.global_event_index);
+            let expected_duration_frames = slot_events[0].duration_frames;
+            for event in slot_events.iter().skip(1) {
+                if event.duration_frames != expected_duration_frames {
+                    return Err(SoundEncodingError::MismatchedSlotDuration {
+                        time_slot: slot_index as u32,
+                        expected: expected_duration_frames,
+                        found: event.duration_frames,
+                        global_event_index: event.global_event_index,
+                    });
+                }
             }
-        }
+            expected_duration_frames
+        };
 
         let samples_per_event =
             samples_for_duration(expected_duration_frames, sample_rate_hz, frames_per_second)?;
@@ -141,8 +166,7 @@ pub fn render_scene_sound_wav(
                 let eased = easing_progress(t, event.easing);
                 let x = lerp(event.start_point.x, event.end_point.x, eased);
                 let y = lerp(event.start_point.y, event.end_point.y, eased);
-                let base_frequency = base_frequency_for_shape(event.shape_index);
-                let waveform = waveform_for_shape(event.shape_index);
+                let (base_frequency, waveform) = shape_profiles[event.shape_index];
                 let frequency = modulated_frequency(base_frequency, x, modulation_depth);
                 let amplitude = modulated_amplitude(event_gain, y, modulation_depth);
                 let sample_time = sample_index as f64 / sample_rate_hz as f64;
@@ -218,26 +242,20 @@ fn slot_progress(sample_index: usize, sample_count: usize) -> f64 {
     sample_index as f64 / (sample_count - 1) as f64
 }
 
-fn base_frequency_for_shape(shape_index: usize) -> f64 {
-    let color_index = color_index_for_shape(shape_index);
-    220.0 * 2.0_f64.powf(color_index as f64 / COLOR_PALETTE_SIZE as f64)
+fn base_frequency_for_canonical_rank(canonical_rank: usize) -> f64 {
+    let class_count = canonical_class_count();
+    let ratio = canonical_rank as f64 / class_count as f64;
+    220.0 * pow(2.0_f64, ratio)
 }
 
-fn color_index_for_shape(shape_index: usize) -> usize {
-    shape_index % COLOR_PALETTE_SIZE
-}
-
-fn shape_type_index(shape_index: usize) -> usize {
-    shape_index % SHAPE_TYPE_PALETTE_SIZE
-}
-
-fn waveform_for_shape(shape_index: usize) -> SoundShapeWaveform {
-    match shape_type_index(shape_index) {
+fn waveform_for_shape_type(shape_type_index: usize) -> SoundShapeWaveform {
+    match shape_type_index {
         0 => SoundShapeWaveform::Sine,
         1 => SoundShapeWaveform::Triangle,
         2 => SoundShapeWaveform::Square,
         3 => SoundShapeWaveform::Sawtooth,
-        _ => SoundShapeWaveform::Pulse,
+        4 => SoundShapeWaveform::Pulse,
+        _ => SoundShapeWaveform::Sine,
     }
 }
 
@@ -260,7 +278,7 @@ fn pan_from_x_position(x: f64) -> (f64, f64) {
 fn waveform_sample(shape_waveform: SoundShapeWaveform, phase: f64) -> f64 {
     let periodic_phase = phase - phase.floor();
     match shape_waveform {
-        SoundShapeWaveform::Sine => (2.0 * PI * periodic_phase).sin(),
+        SoundShapeWaveform::Sine => sin(2.0 * PI * periodic_phase),
         SoundShapeWaveform::Triangle => 2.0 * (2.0 * periodic_phase - 1.0).abs() - 1.0,
         SoundShapeWaveform::Square => {
             if periodic_phase < 0.5 {
@@ -307,7 +325,7 @@ fn easing_progress(progress: f64, easing: EasingFamily) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::EasingFamily;
+    use crate::config::{EasingFamily, ShapeIdentityAssignment};
     use crate::scene_generation::{
         MotionEvent, MotionEventAccounting, SceneGenerationOutput, SceneGenerationParams,
         SceneProjectionMode, SceneShapePath, generate_scene,
@@ -344,6 +362,7 @@ mod tests {
         SceneGenerationOutput {
             scene_index: 0,
             schedule: SceneSeedSchedule::derive(7, 0),
+            shape_identity_assignment: ShapeIdentityAssignment::IndexLocked,
             shape_paths: (0..shape_count)
                 .map(|idx| SceneShapePath {
                     shape_index: idx,
@@ -363,6 +382,7 @@ mod tests {
             }],
             accounting: MotionEventAccounting {
                 expected_total: 1,
+                expected_slots: 1,
                 generated_total: 1,
                 expected_per_shape: generated_per_shape.clone(),
                 generated_per_shape,
@@ -448,6 +468,7 @@ mod tests {
         let scene = SceneGenerationOutput {
             scene_index: 0,
             schedule: SceneSeedSchedule::derive(1, 0),
+            shape_identity_assignment: ShapeIdentityAssignment::IndexLocked,
             shape_paths: vec![SceneShapePath {
                 shape_index: 0,
                 trajectory_points: vec![
@@ -468,6 +489,7 @@ mod tests {
             }],
             accounting: MotionEventAccounting {
                 expected_total: 1,
+                expected_slots: 1,
                 generated_total: 1,
                 expected_per_shape: vec![1],
                 generated_per_shape: vec![1],
@@ -496,6 +518,7 @@ mod tests {
         let scene = SceneGenerationOutput {
             scene_index: 0,
             schedule: SceneSeedSchedule::derive(1, 0),
+            shape_identity_assignment: ShapeIdentityAssignment::IndexLocked,
             shape_paths: vec![SceneShapePath {
                 shape_index: 0,
                 trajectory_points: vec![
@@ -516,6 +539,7 @@ mod tests {
             }],
             accounting: MotionEventAccounting {
                 expected_total: 1,
+                expected_slots: 1,
                 generated_total: 1,
                 expected_per_shape: vec![1],
                 generated_per_shape: vec![1],
@@ -536,6 +560,34 @@ mod tests {
                 global_event_index: 7
             }
         ));
+    }
+
+    #[test]
+    fn render_scene_sound_wav_rejects_empty_scene() {
+        let scene = SceneGenerationOutput {
+            scene_index: 0,
+            schedule: SceneSeedSchedule::derive(1, 0),
+            shape_identity_assignment: ShapeIdentityAssignment::IndexLocked,
+            shape_paths: Vec::new(),
+            motion_events: Vec::new(),
+            accounting: MotionEventAccounting {
+                expected_total: 0,
+                expected_slots: 0,
+                generated_total: 0,
+                expected_per_shape: Vec::new(),
+                generated_per_shape: Vec::new(),
+            },
+        };
+
+        let err = render_scene_sound_wav(
+            &scene,
+            44100,
+            24,
+            250,
+            SoundChannelMapping::StereoAlternating,
+        )
+        .expect_err("empty scene should fail");
+        assert!(matches!(err, SoundEncodingError::NoMotionEvents));
     }
 
     #[test]
@@ -584,13 +636,13 @@ mod tests {
     fn render_scene_sound_wav_shape_type_affects_waveform() {
         let config = bootstrap_config();
         let circle_scene = synthesize_single_event_scene(
-            9,
+            6,
             0,
             NormalizedPoint::new(0.0, 0.0).expect("point must build"),
         );
         let pentagon_scene = synthesize_single_event_scene(
-            9,
-            8,
+            6,
+            4,
             NormalizedPoint::new(0.0, 0.0).expect("point must build"),
         );
 

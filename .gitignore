@@ -1,2 +1,3 @@
 /target
 /.venv
+crates/shapeflow-py/python/shapeflow/*.so

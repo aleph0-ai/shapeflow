@@ -1,5 +1,3 @@
-use crate::landscape::SoftQuadrantMembership;
-
 const SFT_MAGIC: [u8; 4] = *b"SFTT";
 const SFG_MAGIC: [u8; 4] = *b"SFGR";
 const SFL_MAGIC: [u8; 4] = *b"SFLA";
@@ -41,12 +39,12 @@ pub enum ArtifactSerializationError {
         trailing_bytes: usize,
     },
     #[error(
-        "target component out of range for segment {segment_index}, component {component_index}: {value}"
+        "target segment width mismatch at segment {segment_index}: expected {expected}, found {found}"
     )]
-    TargetComponentOutOfRange {
+    TargetSegmentWidthMismatch {
         segment_index: usize,
-        component_index: usize,
-        value: f64,
+        expected: usize,
+        found: usize,
     },
     #[error(
         "edge index out of range at edge {edge_index}: src={src}, dst={dst}, n_nodes={node_count}"
@@ -66,7 +64,7 @@ pub struct TargetArtifact {
     pub schema_version: u32,
     pub scene_id: String,
     pub task_id: String,
-    pub segments: Vec<SoftQuadrantMembership>,
+    pub segments: Vec<Vec<f64>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,7 +101,18 @@ pub fn serialize_target_artifact(
     artifact: &TargetArtifact,
 ) -> Result<Vec<u8>, ArtifactSerializationError> {
     let segment_count = to_u32_len(artifact.segments.len(), "target.segments")?;
-    let mut bytes = Vec::with_capacity(4 + 4 + SFT_SCENE_ID_BYTES + SFT_TASK_ID_BYTES + 4);
+    let component_count = artifact.segments.first().map_or(0usize, Vec::len);
+    for (segment_index, segment) in artifact.segments.iter().enumerate() {
+        if segment.len() != component_count {
+            return Err(ArtifactSerializationError::TargetSegmentWidthMismatch {
+                segment_index,
+                expected: component_count,
+                found: segment.len(),
+            });
+        }
+    }
+    let component_count_u32 = to_u32_len(component_count, "target.segment_width")?;
+    let mut bytes = Vec::with_capacity(4 + 4 + SFT_SCENE_ID_BYTES + SFT_TASK_ID_BYTES + 8);
     bytes.extend_from_slice(&SFT_MAGIC);
     bytes.extend_from_slice(&artifact.schema_version.to_le_bytes());
     bytes.extend_from_slice(&encode_fixed_utf8(
@@ -117,19 +126,19 @@ pub fn serialize_target_artifact(
         "task_id",
     )?);
     bytes.extend_from_slice(&segment_count.to_le_bytes());
+    bytes.extend_from_slice(&component_count_u32.to_le_bytes());
 
-    for (segment_index, segment) in artifact.segments.iter().enumerate() {
-        let values = segment.as_array();
-        for (component_index, value) in values.into_iter().enumerate() {
-            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                return Err(ArtifactSerializationError::TargetComponentOutOfRange {
-                    segment_index,
-                    component_index,
-                    value,
+    for segment in &artifact.segments {
+        for value in segment {
+            if !value.is_finite() {
+                return Err(ArtifactSerializationError::NonFiniteFloat {
+                    field: "target.segments",
+                    value: *value,
                 });
             }
             bytes.extend_from_slice(&value.to_le_bytes());
         }
+        debug_assert_eq!(segment.len(), component_count, "checked above");
     }
 
     Ok(bytes)
@@ -186,24 +195,29 @@ pub fn deserialize_target_artifact(
         "task_id",
     )?;
     let segment_count = read_u32(bytes, &mut offset, "sft.n_segments")? as usize;
+    let component_count = read_u32(bytes, &mut offset, "sft.segment_width")? as usize;
 
     let mut segments = Vec::with_capacity(segment_count);
     for segment_index in 0..segment_count {
-        let q1 = read_f64(bytes, &mut offset, "sft.segment.q1")?;
-        let q2 = read_f64(bytes, &mut offset, "sft.segment.q2")?;
-        let q3 = read_f64(bytes, &mut offset, "sft.segment.q3")?;
-        let q4 = read_f64(bytes, &mut offset, "sft.segment.q4")?;
-        let values = [q1, q2, q3, q4];
-        for (component_index, value) in values.into_iter().enumerate() {
-            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                return Err(ArtifactSerializationError::TargetComponentOutOfRange {
-                    segment_index,
-                    component_index,
+        let mut segment = Vec::with_capacity(component_count);
+        for _ in 0..component_count {
+            let value = read_f64(bytes, &mut offset, "sft.segment.value")?;
+            if !value.is_finite() {
+                return Err(ArtifactSerializationError::NonFiniteFloat {
+                    field: "target.segments",
                     value,
                 });
             }
+            segment.push(value);
         }
-        segments.push(SoftQuadrantMembership { q1, q2, q3, q4 });
+        if segment.len() != component_count {
+            return Err(ArtifactSerializationError::TargetSegmentWidthMismatch {
+                segment_index,
+                expected: component_count,
+                found: segment.len(),
+            });
+        }
+        segments.push(segment);
     }
 
     ensure_no_trailing_bytes(bytes, offset, "sft")?;
@@ -477,25 +491,32 @@ mod tests {
             schema_version: 1,
             scene_id: "0000000000000000000000000000000a".to_string(),
             task_id: "oqp0001".to_string(),
-            segments: vec![
-                SoftQuadrantMembership {
-                    q1: 0.5,
-                    q2: 0.25,
-                    q3: 0.15,
-                    q4: 0.10,
-                },
-                SoftQuadrantMembership {
-                    q1: 0.2,
-                    q2: 0.3,
-                    q3: 0.3,
-                    q4: 0.2,
-                },
-            ],
+            segments: vec![vec![0.5, 0.25, 0.15, 0.10], vec![0.2, 0.3, 0.3, 0.2]],
         };
 
         let bytes = serialize_target_artifact(&artifact).expect("serialize should succeed");
         let decoded = deserialize_target_artifact(&bytes).expect("deserialize should succeed");
         assert_eq!(decoded, artifact);
+    }
+
+    #[test]
+    fn target_artifact_rejects_mixed_segment_width() {
+        let artifact = TargetArtifact {
+            schema_version: 1,
+            scene_id: "0000000000000000000000000000000a".to_string(),
+            task_id: "oqp0001".to_string(),
+            segments: vec![vec![0.5, 0.25], vec![0.2, 0.3, 0.3]],
+        };
+
+        let err = serialize_target_artifact(&artifact).expect_err("serialization should fail");
+        assert!(matches!(
+            err,
+            ArtifactSerializationError::TargetSegmentWidthMismatch {
+                segment_index: 1,
+                expected: 2,
+                found: 3,
+            }
+        ));
     }
 
     #[test]

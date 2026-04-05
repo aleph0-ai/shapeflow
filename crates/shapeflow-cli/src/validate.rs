@@ -8,11 +8,10 @@ use anyhow::{Context, Result, ensure};
 use camino::Utf8PathBuf;
 use shapeflow_core::{
     SceneGenerationParams, SceneProjectionMode, TargetArtifact, build_split_assignments,
-    deserialize_site_graph_artifact, deserialize_target_artifact,
-    generate_ordered_quadrant_passage_targets, generate_scene,
-    landscape_validation::validate_empirical_landscape, serialize_site_graph_artifact,
-    serialize_target_artifact, validate_ordered_quadrant_passage_targets, validate_scene_sound_wav,
-    validate_site_graph_with_artifact,
+    deserialize_site_graph_artifact, deserialize_target_artifact, generate_all_scene_targets,
+    generate_scene, landscape_validation::validate_empirical_landscape,
+    serialize_site_graph_artifact, serialize_target_artifact, validate_generated_targets,
+    validate_scene_sound_wav, validate_site_graph_with_artifact,
 };
 
 #[allow(dead_code)]
@@ -161,35 +160,34 @@ pub(crate) fn run_validate_with_generated_materialization(
     }
 
     if targets {
-        let mut total_shape_targets = 0usize;
+        let mut total_targets = 0usize;
         let mut total_segments = 0usize;
-        let mut hard_segments = 0usize;
+        let mut total_values = 0usize;
         let mut total_target_bytes = 0usize;
         for output in &generated_scenes {
-            let targets = generate_ordered_quadrant_passage_targets(output).with_context(|| {
+            let targets = generate_all_scene_targets(output).with_context(|| {
                 format!(
-                    "ordered quadrant target generation failed for scene_index={}",
+                    "target generation failed for scene_index={}",
                     output.scene_index
                 )
             })?;
-            let report =
-                validate_ordered_quadrant_passage_targets(&targets).with_context(|| {
-                    format!(
-                        "ordered quadrant target validation failed for scene_index={}",
-                        output.scene_index
-                    )
-                })?;
-            total_shape_targets += report.shape_target_count;
+            let report = validate_generated_targets(&targets).with_context(|| {
+                format!(
+                    "target validation failed for scene_index={}",
+                    output.scene_index
+                )
+            })?;
+            total_targets += report.target_count;
             total_segments += report.total_segments;
-            hard_segments += report.hard_segment_count;
+            total_values += report.total_values;
 
             let scene_id = format!("{:032x}", output.scene_index);
             for target in &targets {
-                let task_id = format!("oqp{:04}", target.shape_index);
+                let task_id = target.task_id.clone();
                 let artifact = TargetArtifact {
                     schema_version: config.schema_version,
                     scene_id: scene_id.clone(),
-                    task_id,
+                    task_id: task_id.clone(),
                     segments: target.segments.clone(),
                 };
                 let bytes = serialize_target_artifact(&artifact)
@@ -206,11 +204,11 @@ pub(crate) fn run_validate_with_generated_materialization(
 
         println!("validation=targets-ok");
         println!(
-            "validated_scene_count={}, shape_targets={}, total_segments={}, hard_segments={}, sft_total_bytes={}",
+            "validated_scene_count={}, targets={}, total_segments={}, total_values={}, sft_total_bytes={}",
             generated_scenes.len(),
-            total_shape_targets,
+            total_targets,
             total_segments,
-            hard_segments,
+            total_values,
             total_target_bytes
         );
         ran_specific_check = true;

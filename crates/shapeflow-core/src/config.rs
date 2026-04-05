@@ -7,7 +7,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub enum ConfigError {
     #[error("unsupported schema version {found}, expected {expected}")]
     UnsupportedSchemaVersion { found: u32, expected: u32 },
-    #[error("scene.n_shapes must be in [1, 5], got {0}")]
+    #[error("scene.n_shapes must be in [1, 6], got {0}")]
     InvalidShapeCount(u8),
     #[error("scene.trajectory_complexity must be in [1, 4], got {0}")]
     InvalidTrajectoryComplexity(u8),
@@ -15,6 +15,8 @@ pub enum ConfigError {
     InvalidResolution,
     #[error("scene.event_duration_frames must be > 0")]
     InvalidEventDurationFrames,
+    #[error("scene.n_motion_slots must be > 0")]
+    InvalidMotionSlotCount,
     #[error("scene.sound_sample_rate_hz must be > 0, got {sample_rate_hz}")]
     InvalidSoundSampleRateHz { sample_rate_hz: u32 },
     #[error("scene.sound_frames_per_second must be > 0, got {frames_per_second}")]
@@ -50,12 +52,60 @@ pub enum ConfigError {
         "scene.motion_events_per_shape length ({found}) must equal scene.n_shapes ({expected})"
     )]
     MotionEventsLengthMismatch { found: usize, expected: usize },
-    #[error("scene.motion_events_per_shape values must be > 0")]
-    ZeroMotionEventEntry,
     #[error(
-        "scene.n_motion_events_total ({found}) must equal sum(scene.motion_events_per_shape) ({expected})"
+        "scene.motion_events_per_shape_random_ranges length ({found}) must equal scene.n_shapes ({expected})"
     )]
-    MotionEventsTotalMismatch { found: u32, expected: u32 },
+    MotionEventsRandomRangeLengthMismatch { found: usize, expected: usize },
+    #[error(
+        "scene.motion_events_per_shape and scene.motion_events_per_shape_random_ranges are mutually exclusive; provide only one"
+    )]
+    MotionEventsSourceConflict,
+    #[error(
+        "scene.motion_events_per_shape_random_ranges requires scene.randomize_motion_events_per_shape = true"
+    )]
+    RandomRangesRequireRandomization,
+    #[error(
+        "motion_events_per_shape_random_ranges[{shape_index}] has min > max (min={min}, max={max})"
+    )]
+    MotionEventsRandomRangeInvalid {
+        shape_index: usize,
+        min: u16,
+        max: u16,
+    },
+    #[error(
+        "scene.motion_events_per_shape[{shape_index}] ({count}) exceeds scene.n_motion_slots ({slots})"
+    )]
+    MotionEventsPerShapeExceedsSlots {
+        shape_index: usize,
+        count: u16,
+        slots: u32,
+    },
+    #[error(
+        "motion_events_per_shape_random_ranges[{shape_index}] has max ({max}) greater than scene.n_motion_slots ({slots})"
+    )]
+    MotionEventsRandomRangeMaxExceedsSlots {
+        shape_index: usize,
+        max: u16,
+        slots: u32,
+    },
+    #[error(
+        "scene.n_motion_events_total ({cap}) exceeds capacity ({capacity}) for allow_simultaneous={allow_simultaneous}, n_shapes={n_shapes}, n_motion_slots={n_motion_slots}"
+    )]
+    MotionEventsCapExceedsCapacity {
+        cap: u32,
+        capacity: u32,
+        allow_simultaneous: bool,
+        n_shapes: u8,
+        n_motion_slots: u32,
+    },
+    #[error(
+        "explicit motion event total ({found}) exceeds scene.n_motion_events_total cap ({cap})"
+    )]
+    MotionEventsCapExceededByExplicitTotal { found: u32, cap: u32 },
+    #[error(
+        "scene.motion_events_per_shape_random_ranges minimum total ({min_total}) exceeds scene.n_motion_events_total cap ({cap})"
+    )]
+    MotionEventsRandomRangesMinExceedsCap { min_total: u32, cap: u32 },
     #[error("failed to serialize canonical hash payload: {0}")]
     CanonicalHashSerialization(String),
 }
@@ -96,6 +146,13 @@ pub enum EasingFamily {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ShapeIdentityAssignment {
+    IndexLocked,
+    PairUniqueRandom,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SoundChannelMapping {
     MonoMix,
     StereoAlternating,
@@ -126,15 +183,30 @@ pub struct SiteGraphConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MotionEventsPerShapeRange {
+    pub min: u16,
+    pub max: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SceneConfig {
     pub resolution: u32,
     pub n_shapes: u8,
     pub trajectory_complexity: u8,
     pub event_duration_frames: u16,
     pub easing_family: EasingFamily,
+    pub n_motion_slots: u32,
+    #[serde(default)]
     pub motion_events_per_shape: Vec<u16>,
-    pub n_motion_events_total: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_motion_events_total: Option<u32>,
     pub allow_simultaneous: bool,
+    #[serde(default = "default_shape_identity_assignment")]
+    pub shape_identity_assignment: ShapeIdentityAssignment,
+    #[serde(default = "default_randomize_motion_events_per_shape")]
+    pub randomize_motion_events_per_shape: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion_events_per_shape_random_ranges: Option<Vec<MotionEventsPerShapeRange>>,
     pub sound_sample_rate_hz: u32,
     pub sound_frames_per_second: u16,
     pub sound_modulation_depth_per_mille: u16,
@@ -165,8 +237,16 @@ const fn default_image_frame_scatter() -> bool {
     false
 }
 
+const fn default_shape_identity_assignment() -> ShapeIdentityAssignment {
+    ShapeIdentityAssignment::IndexLocked
+}
+
 const fn default_image_arrow_type() -> ImageArrowType {
     ImageArrowType::Next
+}
+
+const fn default_randomize_motion_events_per_shape() -> bool {
+    false
 }
 
 const fn default_text_reference_frame() -> TextReferenceFrame {
@@ -215,13 +295,17 @@ impl ShapeFlowConfig {
             generation_profile: None,
             scene: SceneConfig {
                 resolution: 512,
-                n_shapes: 2,
+                n_shapes: 3,
                 trajectory_complexity: 2,
                 event_duration_frames: 24,
                 easing_family: EasingFamily::EaseInOut,
-                motion_events_per_shape: vec![3, 3],
-                n_motion_events_total: 6,
-                allow_simultaneous: true,
+                n_motion_slots: 12,
+                motion_events_per_shape: vec![4, 4, 4],
+                n_motion_events_total: None,
+                allow_simultaneous: false,
+                shape_identity_assignment: ShapeIdentityAssignment::IndexLocked,
+                randomize_motion_events_per_shape: true,
+                motion_events_per_shape_random_ranges: None,
                 sound_sample_rate_hz: 44_100,
                 sound_frames_per_second: 24,
                 sound_modulation_depth_per_mille: 250,
@@ -299,9 +383,13 @@ impl ShapeFlowConfig {
                 trajectory_complexity: 1,
                 event_duration_frames,
                 easing_family,
+                n_motion_slots: u32::from(events_per_shape),
                 motion_events_per_shape: vec![events_per_shape],
-                n_motion_events_total: u32::from(events_per_shape),
+                n_motion_events_total: None,
                 allow_simultaneous,
+                shape_identity_assignment: ShapeIdentityAssignment::IndexLocked,
+                randomize_motion_events_per_shape: false,
+                motion_events_per_shape_random_ranges: None,
                 sound_sample_rate_hz,
                 sound_frames_per_second,
                 sound_modulation_depth_per_mille,
@@ -428,7 +516,7 @@ impl ShapeFlowConfig {
                 expected: CURRENT_SCHEMA_VERSION,
             });
         }
-        if !(1..=5).contains(&self.scene.n_shapes) {
+        if !(1..=6).contains(&self.scene.n_shapes) {
             return Err(ConfigError::InvalidShapeCount(self.scene.n_shapes));
         }
         if !(1..=4).contains(&self.scene.trajectory_complexity) {
@@ -441,6 +529,9 @@ impl ShapeFlowConfig {
         }
         if self.scene.event_duration_frames == 0 {
             return Err(ConfigError::InvalidEventDurationFrames);
+        }
+        if self.scene.n_motion_slots == 0 {
+            return Err(ConfigError::InvalidMotionSlotCount);
         }
         if self.scene.sound_sample_rate_hz == 0 {
             return Err(ConfigError::InvalidSoundSampleRateHz {
@@ -516,35 +607,151 @@ impl ShapeFlowConfig {
         }
 
         let expected_shapes = self.scene.n_shapes as usize;
-        let found_shapes = self.scene.motion_events_per_shape.len();
-        if found_shapes != expected_shapes {
-            return Err(ConfigError::MotionEventsLengthMismatch {
-                found: found_shapes,
-                expected: expected_shapes,
-            });
+        let mode_capacity = mode_capacity(
+            self.scene.n_motion_slots,
+            self.scene.n_shapes,
+            self.scene.allow_simultaneous,
+        );
+        if let Some(cap) = self.scene.n_motion_events_total {
+            if cap > mode_capacity {
+                return Err(ConfigError::MotionEventsCapExceedsCapacity {
+                    cap,
+                    capacity: mode_capacity,
+                    allow_simultaneous: self.scene.allow_simultaneous,
+                    n_shapes: self.scene.n_shapes,
+                    n_motion_slots: self.scene.n_motion_slots,
+                });
+            }
         }
 
-        if self
-            .scene
-            .motion_events_per_shape
-            .iter()
-            .any(|count| *count == 0)
-        {
-            return Err(ConfigError::ZeroMotionEventEntry);
-        }
+        if self.scene.randomize_motion_events_per_shape {
+            if let Some(random_ranges) = self.scene.motion_events_per_shape_random_ranges.as_ref() {
+                if !self.scene.motion_events_per_shape.is_empty() {
+                    return Err(ConfigError::MotionEventsSourceConflict);
+                }
+                if random_ranges.len() != expected_shapes {
+                    return Err(ConfigError::MotionEventsRandomRangeLengthMismatch {
+                        found: random_ranges.len(),
+                        expected: expected_shapes,
+                    });
+                }
+                let (min_total, _max_total) = random_ranges.iter().enumerate().try_fold(
+                    (0u32, 0u32),
+                    |(min_total, max_total), (shape_index, range)| {
+                        if range.min > range.max {
+                            return Err(ConfigError::MotionEventsRandomRangeInvalid {
+                                shape_index,
+                                min: range.min,
+                                max: range.max,
+                            });
+                        }
+                        if u32::from(range.max) > self.scene.n_motion_slots {
+                            return Err(ConfigError::MotionEventsRandomRangeMaxExceedsSlots {
+                                shape_index,
+                                max: range.max,
+                                slots: self.scene.n_motion_slots,
+                            });
+                        }
 
-        let expected_total: u32 = self
-            .scene
-            .motion_events_per_shape
-            .iter()
-            .copied()
-            .map(u32::from)
-            .sum();
-        if self.scene.n_motion_events_total != expected_total {
-            return Err(ConfigError::MotionEventsTotalMismatch {
-                found: self.scene.n_motion_events_total,
-                expected: expected_total,
-            });
+                        Ok((
+                            min_total + u32::from(range.min),
+                            max_total + u32::from(range.max),
+                        ))
+                    },
+                )?;
+
+                if min_total > mode_capacity {
+                    return Err(ConfigError::MotionEventsCapExceedsCapacity {
+                        cap: min_total,
+                        capacity: mode_capacity,
+                        allow_simultaneous: self.scene.allow_simultaneous,
+                        n_shapes: self.scene.n_shapes,
+                        n_motion_slots: self.scene.n_motion_slots,
+                    });
+                }
+                if let Some(cap) = self.scene.n_motion_events_total {
+                    if min_total > cap {
+                        return Err(ConfigError::MotionEventsRandomRangesMinExceedsCap {
+                            min_total,
+                            cap,
+                        });
+                    }
+                }
+            } else {
+                let found_shapes = self.scene.motion_events_per_shape.len();
+                if found_shapes != 0 && found_shapes != expected_shapes {
+                    return Err(ConfigError::MotionEventsLengthMismatch {
+                        found: found_shapes,
+                        expected: expected_shapes,
+                    });
+                }
+                for (shape_index, count) in self
+                    .scene
+                    .motion_events_per_shape
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    if u32::from(count) > self.scene.n_motion_slots {
+                        return Err(ConfigError::MotionEventsPerShapeExceedsSlots {
+                            shape_index,
+                            count,
+                            slots: self.scene.n_motion_slots,
+                        });
+                    }
+                }
+            }
+        } else {
+            if self.scene.motion_events_per_shape_random_ranges.is_some() {
+                return Err(ConfigError::RandomRangesRequireRandomization);
+            }
+            let found_shapes = self.scene.motion_events_per_shape.len();
+            if found_shapes != expected_shapes {
+                return Err(ConfigError::MotionEventsLengthMismatch {
+                    found: found_shapes,
+                    expected: expected_shapes,
+                });
+            }
+            for (shape_index, count) in self
+                .scene
+                .motion_events_per_shape
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                if u32::from(count) > self.scene.n_motion_slots {
+                    return Err(ConfigError::MotionEventsPerShapeExceedsSlots {
+                        shape_index,
+                        count,
+                        slots: self.scene.n_motion_slots,
+                    });
+                }
+            }
+
+            let explicit_total: u32 = self
+                .scene
+                .motion_events_per_shape
+                .iter()
+                .copied()
+                .map(u32::from)
+                .sum();
+            if explicit_total > mode_capacity {
+                return Err(ConfigError::MotionEventsCapExceedsCapacity {
+                    cap: explicit_total,
+                    capacity: mode_capacity,
+                    allow_simultaneous: self.scene.allow_simultaneous,
+                    n_shapes: self.scene.n_shapes,
+                    n_motion_slots: self.scene.n_motion_slots,
+                });
+            }
+            if let Some(cap) = self.scene.n_motion_events_total {
+                if explicit_total > cap {
+                    return Err(ConfigError::MotionEventsCapExceededByExplicitTotal {
+                        found: explicit_total,
+                        cap,
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -595,16 +802,26 @@ impl ShapeFlowConfig {
     }
 }
 
+fn mode_capacity(n_motion_slots: u32, n_shapes: u8, allow_simultaneous: bool) -> u32 {
+    if allow_simultaneous {
+        n_motion_slots.saturating_mul(u32::from(n_shapes))
+    } else {
+        n_motion_slots
+    }
+}
+
 fn apply_shape_count_profile(config: &mut ShapeFlowConfig, n_shapes: u8) {
     let events_per_shape = config
         .scene
         .motion_events_per_shape
         .first()
         .copied()
-        .unwrap_or(1);
+        .unwrap_or(0);
     config.scene.n_shapes = n_shapes;
     config.scene.motion_events_per_shape = vec![events_per_shape; n_shapes as usize];
-    config.scene.n_motion_events_total = u32::from(events_per_shape) * u32::from(n_shapes);
+    config.scene.n_motion_events_total = None;
+    config.scene.randomize_motion_events_per_shape = false;
+    config.scene.motion_events_per_shape_random_ranges = None;
 }
 
 #[cfg(test)]
@@ -621,8 +838,8 @@ n_shapes = 2
 trajectory_complexity = 2
 event_duration_frames = 24
 easing_family = "ease_in_out"
+n_motion_slots = 6
 motion_events_per_shape = [3, 3]
-n_motion_events_total = 6
 allow_simultaneous = true
 sound_sample_rate_hz = 44100
 sound_frames_per_second = 24
@@ -653,16 +870,13 @@ num_threads = 4
     }
 
     #[test]
-    fn validation_rejects_motion_event_total_mismatch() {
+    fn validation_rejects_motion_event_cap_smaller_than_explicit_total() {
         let mut cfg = sample_config();
-        cfg.scene.n_motion_events_total = 5;
+        cfg.scene.n_motion_events_total = Some(5);
         let err = cfg.validate().expect_err("config should fail validation");
         assert!(matches!(
             err,
-            ConfigError::MotionEventsTotalMismatch {
-                found: 5,
-                expected: 6
-            }
+            ConfigError::MotionEventsCapExceededByExplicitTotal { found: 6, cap: 5 }
         ));
     }
 
@@ -959,7 +1173,8 @@ num_threads = 4
         assert_eq!(cfg.scene.resolution, 512);
         assert_eq!(cfg.scene.event_duration_frames, 24);
         assert_eq!(cfg.scene.motion_events_per_shape, vec![3, 3]);
-        assert_eq!(cfg.scene.n_motion_events_total, 6);
+        assert_eq!(cfg.scene.n_motion_slots, 3);
+        assert_eq!(cfg.scene.n_motion_events_total, None);
         assert_eq!(cfg.scene.trajectory_complexity, 1);
         let profile = cfg
             .generation_profile
@@ -979,5 +1194,196 @@ num_threads = 4
         let hash_a = cfg_a.config_hash().expect("hash must compute");
         let hash_b = cfg_b.config_hash().expect("hash must compute");
         assert_ne!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn parses_randomized_motion_event_ranges() {
+        let cfg_toml = r#"
+schema_version = 1
+master_seed = 1234
+
+[scene]
+resolution = 512
+n_shapes = 3
+trajectory_complexity = 2
+event_duration_frames = 24
+easing_family = "ease_in_out"
+n_motion_slots = 12
+allow_simultaneous = true
+randomize_motion_events_per_shape = true
+motion_events_per_shape_random_ranges = [
+  { min = 0, max = 12 },
+  { min = 0, max = 12 },
+  { min = 0, max = 12 },
+]
+sound_sample_rate_hz = 44100
+sound_frames_per_second = 24
+sound_modulation_depth_per_mille = 250
+sound_channel_mapping = "stereo_alternating"
+text_reference_frame = "canonical"
+text_synonym_rate = 0.0
+text_typo_rate = 0.0
+
+[positional_landscape]
+x_nonlinearity = "sigmoid"
+y_nonlinearity = "tanh"
+x_steepness = 3.0
+y_steepness = 2.0
+
+[site_graph]
+site_k = 10
+lambda2_min = 0.05
+validation_scene_count = 32
+lambda2_iterations = 64
+
+[parallelism]
+num_threads = 4
+"#;
+
+        let cfg: ShapeFlowConfig =
+            toml::from_str(cfg_toml).expect("random ranges config should parse");
+        assert!(cfg.scene.motion_events_per_shape_random_ranges.is_some());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_motion_event_source_conflict() {
+        let mut cfg = sample_config();
+        cfg.scene.n_shapes = 3;
+        cfg.scene.n_motion_slots = 12;
+        cfg.scene.motion_events_per_shape = vec![4, 4, 4];
+        cfg.scene.n_motion_events_total = None;
+        cfg.scene.randomize_motion_events_per_shape = true;
+        cfg.scene.motion_events_per_shape_random_ranges = Some(vec![
+            MotionEventsPerShapeRange { min: 0, max: 12 },
+            MotionEventsPerShapeRange { min: 0, max: 12 },
+            MotionEventsPerShapeRange { min: 0, max: 12 },
+        ]);
+
+        let err = cfg.validate().expect_err("config should fail validation");
+        assert!(matches!(err, ConfigError::MotionEventsSourceConflict));
+    }
+
+    #[test]
+    fn validation_rejects_random_ranges_when_randomization_disabled() {
+        let mut cfg = sample_config();
+        cfg.scene.randomize_motion_events_per_shape = false;
+        cfg.scene.motion_events_per_shape_random_ranges = Some(vec![
+            MotionEventsPerShapeRange { min: 1, max: 3 },
+            MotionEventsPerShapeRange { min: 1, max: 3 },
+        ]);
+
+        let err = cfg.validate().expect_err("config should fail validation");
+        assert!(matches!(err, ConfigError::RandomRangesRequireRandomization));
+    }
+
+    #[test]
+    fn validation_rejects_random_range_length_mismatch() {
+        let mut cfg = sample_config();
+        cfg.scene.n_shapes = 3;
+        cfg.scene.n_motion_slots = 12;
+        cfg.scene.motion_events_per_shape = Vec::new();
+        cfg.scene.n_motion_events_total = None;
+        cfg.scene.randomize_motion_events_per_shape = true;
+        cfg.scene.motion_events_per_shape_random_ranges = Some(vec![
+            MotionEventsPerShapeRange { min: 0, max: 12 },
+            MotionEventsPerShapeRange { min: 0, max: 12 },
+        ]);
+
+        let err = cfg.validate().expect_err("config should fail validation");
+        assert!(matches!(
+            err,
+            ConfigError::MotionEventsRandomRangeLengthMismatch {
+                found: 2,
+                expected: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_random_range_min_greater_than_max() {
+        let mut cfg = sample_config();
+        cfg.scene.n_shapes = 2;
+        cfg.scene.n_motion_slots = 8;
+        cfg.scene.motion_events_per_shape = Vec::new();
+        cfg.scene.n_motion_events_total = None;
+        cfg.scene.randomize_motion_events_per_shape = true;
+        cfg.scene.motion_events_per_shape_random_ranges = Some(vec![
+            MotionEventsPerShapeRange { min: 5, max: 4 },
+            MotionEventsPerShapeRange { min: 0, max: 8 },
+        ]);
+
+        let err = cfg.validate().expect_err("config should fail validation");
+        assert!(matches!(
+            err,
+            ConfigError::MotionEventsRandomRangeInvalid {
+                shape_index: 0,
+                min: 5,
+                max: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_random_range_max_greater_than_slots() {
+        let mut cfg = sample_config();
+        cfg.scene.n_shapes = 2;
+        cfg.scene.n_motion_slots = 8;
+        cfg.scene.motion_events_per_shape = Vec::new();
+        cfg.scene.n_motion_events_total = None;
+        cfg.scene.randomize_motion_events_per_shape = true;
+        cfg.scene.motion_events_per_shape_random_ranges = Some(vec![
+            MotionEventsPerShapeRange { min: 0, max: 9 },
+            MotionEventsPerShapeRange { min: 0, max: 8 },
+        ]);
+
+        let err = cfg.validate().expect_err("config should fail validation");
+        assert!(matches!(
+            err,
+            ConfigError::MotionEventsRandomRangeMaxExceedsSlots {
+                shape_index: 0,
+                max: 9,
+                slots: 8
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_random_range_min_total_exceeding_cap() {
+        let mut cfg = sample_config();
+        cfg.scene.n_shapes = 2;
+        cfg.scene.n_motion_slots = 12;
+        cfg.scene.motion_events_per_shape = Vec::new();
+        cfg.scene.n_motion_events_total = Some(10);
+        cfg.scene.randomize_motion_events_per_shape = true;
+        cfg.scene.motion_events_per_shape_random_ranges = Some(vec![
+            MotionEventsPerShapeRange { min: 6, max: 8 },
+            MotionEventsPerShapeRange { min: 6, max: 8 },
+        ]);
+
+        let err = cfg.validate().expect_err("config should fail validation");
+        assert!(matches!(
+            err,
+            ConfigError::MotionEventsRandomRangesMinExceedsCap {
+                min_total: 12,
+                cap: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_explicit_count_above_slot_budget_per_shape() {
+        let mut cfg = sample_config();
+        cfg.scene.motion_events_per_shape = vec![7, 0];
+        cfg.scene.n_motion_slots = 6;
+        let err = cfg.validate().expect_err("config should fail validation");
+        assert!(matches!(
+            err,
+            ConfigError::MotionEventsPerShapeExceedsSlots {
+                shape_index: 0,
+                count: 7,
+                slots: 6
+            }
+        ));
     }
 }

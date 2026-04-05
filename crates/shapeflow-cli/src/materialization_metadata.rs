@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use shapeflow_core::{
     LatentArtifact, SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig,
     canonical_scene_id, deserialize_latent_artifact, deserialize_target_artifact,
-    extract_latent_vector_from_scene, generate_ordered_quadrant_passage_targets, generate_scene,
-    generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
+    expected_target_task_ids, extract_latent_vector_from_scene, generate_all_scene_targets,
+    generate_scene, generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
     render_scene_image_png_with_scene_config, render_scene_sound_wav,
     render_scene_video_frames_png_with_keyframe_border, serialize_latent_artifact,
     serialize_scene_text, serialize_tabular_motion_rows_csv,
@@ -89,7 +89,9 @@ pub(crate) fn validate_generated_materialization_metadata(
     let expected_scene_count = scene_count as usize;
     let expected_target_file_count: usize = effective_scene_configs
         .iter()
-        .map(|effective_config| usize::from(effective_config.scene.n_shapes))
+        .map(|effective_config| {
+            expected_target_task_ids(usize::from(effective_config.scene.n_shapes)).len()
+        })
         .sum();
     let expected_video_frames_per_scene = effective_scene_configs
         .iter()
@@ -249,23 +251,10 @@ pub(crate) fn validate_generated_materialization_metadata(
 }
 
 fn expected_video_frames_per_scene(config: &ShapeFlowConfig) -> Result<usize> {
-    if config.scene.allow_simultaneous {
-        let max_events_per_shape = config
-            .scene
-            .motion_events_per_shape
-            .iter()
-            .copied()
-            .max()
-            .context(
-                "scene.motion_events_per_shape must contain at least one shape to derive expected video frames",
-            )?;
-        Ok(usize::from(max_events_per_shape) * usize::from(config.scene.event_duration_frames))
-    } else {
-        let n_motion_events_total = usize::try_from(config.scene.n_motion_events_total).context(
-            "scene.n_motion_events_total does not fit into usize when deriving expected video frames",
-        )?;
-        Ok(n_motion_events_total * usize::from(config.scene.event_duration_frames))
-    }
+    let n_motion_slots = usize::try_from(config.scene.n_motion_slots).context(
+        "scene.n_motion_slots does not fit into usize when deriving expected video frames",
+    )?;
+    Ok(n_motion_slots * usize::from(config.scene.event_duration_frames))
 }
 
 fn expected_scene_ids(scene_count: u32) -> Vec<String> {
@@ -289,11 +278,11 @@ fn expected_target_filenames(
         .iter()
         .enumerate()
         .flat_map(|(scene_index, scene_id)| {
-            let n_shapes = usize::from(effective_scene_configs[scene_index].scene.n_shapes);
-            (0..n_shapes).map(move |shape_index| {
-                let task_id = format!("oqp{:04}", shape_index);
-                format!("{scene_id}_{task_id}.sft")
-            })
+            expected_target_task_ids(usize::from(
+                effective_scene_configs[scene_index].scene.n_shapes,
+            ))
+            .into_iter()
+            .map(move |task_id| format!("{scene_id}_{task_id}.sft"))
         })
         .collect()
 }
@@ -396,7 +385,8 @@ fn validate_target_artifacts(
 
     for (scene_index, scene_id) in scene_ids.iter().enumerate() {
         let effective_config = &effective_scene_configs[scene_index];
-        let expected_shape_count = usize::from(effective_config.scene.n_shapes);
+        let expected_task_ids =
+            expected_target_task_ids(usize::from(effective_config.scene.n_shapes));
         let params = SceneGenerationParams {
             config: effective_config,
             scene_index: u64::try_from(scene_index).with_context(|| {
@@ -413,29 +403,27 @@ fn validate_target_artifacts(
             )
         })?;
 
-        let generated_targets =
-            generate_ordered_quadrant_passage_targets(&output).with_context(|| {
-                format!("failed to regenerate target payloads for scene_id={scene_id}")
-            })?;
-        let mut target_segments_by_shape = BTreeMap::new();
+        let generated_targets = generate_all_scene_targets(&output).with_context(|| {
+            format!("failed to regenerate target payloads for scene_id={scene_id}")
+        })?;
+        let mut target_segments_by_task = BTreeMap::new();
         for target in generated_targets {
-            let previous = target_segments_by_shape.insert(target.shape_index, target.segments);
+            let previous = target_segments_by_task.insert(target.task_id.clone(), target.segments);
             ensure!(
                 previous.is_none(),
-                "generated target payload validation failed for scene_id={scene_id}: duplicate target shape index {}",
-                target.shape_index
+                "generated target payload validation failed for scene_id={scene_id}: duplicate task_id={}",
+                target.task_id
             );
         }
         ensure!(
-            target_segments_by_shape.len() == expected_shape_count,
+            target_segments_by_task.len() == expected_task_ids.len(),
             "generated target payload validation failed for scene_id={scene_id}: deterministic generation produced {} targets, expected {}",
-            target_segments_by_shape.len(),
-            expected_shape_count
+            target_segments_by_task.len(),
+            expected_task_ids.len()
         );
 
-        for shape_index in 0..expected_shape_count {
-            let task_id = format!("oqp{:04}", shape_index);
-            let expected_segments = target_segments_by_shape.remove(&shape_index).with_context(|| {
+        for task_id in expected_task_ids {
+            let expected_segments = target_segments_by_task.remove(&task_id).with_context(|| {
                 format!(
                     "generated target payload validation failed for scene_id={scene_id}: deterministic target payload missing task_id={task_id}"
                 )
@@ -471,9 +459,9 @@ fn validate_target_artifacts(
         }
 
         ensure!(
-            target_segments_by_shape.is_empty(),
-            "generated target payload validation failed for scene_id={scene_id}: unexpected target shape indices: {:?}",
-            target_segments_by_shape.keys().collect::<Vec<_>>()
+            target_segments_by_task.is_empty(),
+            "generated target payload validation failed for scene_id={scene_id}: unexpected task ids: {:?}",
+            target_segments_by_task.keys().collect::<Vec<_>>()
         );
     }
 

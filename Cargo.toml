@@ -3,6 +3,7 @@ members = [
     "crates/shapeflow-core",
     "crates/shapeflow-cli",
     "crates/shapeflow-py",
+    "crates/shapeflow-human-eval",
 ]
 resolver = "2"
 
@@ -13,19 +14,30 @@ license = "BSD-2-Clause-Patent"
 
 [workspace.dependencies]
 anyhow = "1.0"
+axum = "0.7"
+base64 = "0.22"
 camino = "1.1"
 ciborium = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 hound = "3.5"
+maud = "0.26"
+maud-extensions = "0.4"
 rayon = "1.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
+gif = "0.13"
 hex = "0.4"
 libm = "0.2"
 proptest = "1.6"
 rand = "0.8"
 rand_chacha = "0.3"
+rmcp = "1.3"
+sqlx = { version = "0.8", features = ["postgres", "sqlite", "runtime-tokio-rustls"] }
+tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "net"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2.0"
 toml = "0.8"
 pyo3 = "0.28"
+uuid = { version = "1.11", features = ["serde", "v7"] }

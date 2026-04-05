@@ -1,0 +1,598 @@
+use anyhow::{Context, Result};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{PgPool, Row, SqlitePool};
+use std::str::FromStr;
+
+use crate::{
+    HumanEvalDatabaseConfig,
+    flow::{Difficulty, ModalityTargets},
+};
+
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub session_id: i64,
+    pub participant_id: String,
+    pub seed: i64,
+    pub difficulty: String,
+    pub is_human: bool,
+    pub show_answer_validation: bool,
+    pub end_time_set: bool,
+    pub current_item_index: i32,
+    pub completed: bool,
+}
+
+#[derive(Clone)]
+pub enum DbPool {
+    Postgres(PgPool),
+    Sqlite(SqlitePool),
+}
+
+pub async fn connect_pool(database: &HumanEvalDatabaseConfig) -> Result<DbPool> {
+    match database {
+        HumanEvalDatabaseConfig::PostgresUrl(url) => {
+            let pool = PgPool::connect(url)
+                .await
+                .context("failed to connect to postgres")?;
+            Ok(DbPool::Postgres(pool))
+        }
+        HumanEvalDatabaseConfig::SqlitePath(path) => {
+            let sqlite_url = sqlite_url_from_path(path);
+            let options = SqliteConnectOptions::from_str(&sqlite_url)
+                .with_context(|| format!("failed to parse sqlite connection string: {sqlite_url}"))?
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(options)
+                .await
+                .with_context(|| format!("failed to connect to sqlite at {sqlite_url}"))?;
+            Ok(DbPool::Sqlite(pool))
+        }
+    }
+}
+
+pub async fn ensure_schema(pool: &DbPool) -> Result<()> {
+    execute(pool, create_table_sql(pool))
+        .await
+        .context("failed to create or verify human_eval_sessions table")?;
+
+    execute(
+        pool,
+        r#"CREATE INDEX IF NOT EXISTS idx_human_eval_sessions_active_progress
+           ON human_eval_sessions (completed, current_item_index)"#,
+    )
+    .await
+    .context("failed to create idx_human_eval_sessions_active_progress")?;
+
+    execute(
+        pool,
+        r#"CREATE INDEX IF NOT EXISTS idx_human_eval_sessions_seed
+           ON human_eval_sessions (seed)"#,
+    )
+    .await
+    .context("failed to create idx_human_eval_sessions_seed")?;
+
+    if is_postgres(pool) {
+        execute(
+            pool,
+            r#"ALTER TABLE human_eval_sessions
+               ADD COLUMN IF NOT EXISTS image_target TEXT NOT NULL DEFAULT 'oqp'"#,
+        )
+        .await
+        .context("failed to add image_target column")?;
+
+        execute(
+            pool,
+            r#"ALTER TABLE human_eval_sessions
+               ADD COLUMN IF NOT EXISTS video_target TEXT NOT NULL DEFAULT 'oqp'"#,
+        )
+        .await
+        .context("failed to add video_target column")?;
+
+        execute(
+            pool,
+            r#"ALTER TABLE human_eval_sessions
+               ADD COLUMN IF NOT EXISTS text_target TEXT NOT NULL DEFAULT 'oqp'"#,
+        )
+        .await
+        .context("failed to add text_target column")?;
+
+        execute(
+            pool,
+            r#"ALTER TABLE human_eval_sessions
+               ADD COLUMN IF NOT EXISTS tabular_target TEXT NOT NULL DEFAULT 'oqp'"#,
+        )
+        .await
+        .context("failed to add tabular_target column")?;
+
+        execute(
+            pool,
+            r#"ALTER TABLE human_eval_sessions
+               ADD COLUMN IF NOT EXISTS sound_target TEXT NOT NULL DEFAULT 'oqp'"#,
+        )
+        .await
+        .context("failed to add sound_target column")?;
+
+        execute(
+            pool,
+            r#"ALTER TABLE human_eval_sessions
+               DROP COLUMN IF EXISTS start_time"#,
+        )
+        .await
+        .context("failed to drop start_time column")?;
+    }
+
+    Ok(())
+}
+
+pub async fn create_session(
+    pool: &DbPool,
+    participant_id: &str,
+    seed: i64,
+    difficulty: Difficulty,
+    is_human: bool,
+    show_answer_validation: bool,
+    initial_item_index: i32,
+    modality_targets: &ModalityTargets,
+) -> Result<SessionRecord> {
+    let sql = if is_postgres(pool) {
+        r#"INSERT INTO human_eval_sessions (
+            participant_id,
+            seed,
+            difficulty,
+            is_human,
+            show_answer_validation,
+            current_item_index,
+            image_target,
+            video_target,
+            text_target,
+            tabular_target,
+            sound_target
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING
+            session_id,
+            participant_id,
+            seed,
+            difficulty,
+            is_human,
+            show_answer_validation,
+            end_time IS NOT NULL AS end_time_set,
+            current_item_index,
+            completed"#
+    } else {
+        r#"INSERT INTO human_eval_sessions (
+            participant_id,
+            seed,
+            difficulty,
+            is_human,
+            show_answer_validation,
+            current_item_index,
+            image_target,
+            video_target,
+            text_target,
+            tabular_target,
+            sound_target
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        RETURNING
+            session_id,
+            participant_id,
+            seed,
+            difficulty,
+            is_human,
+            show_answer_validation,
+            end_time IS NOT NULL AS end_time_set,
+            current_item_index,
+            completed"#
+    };
+
+    match pool {
+        DbPool::Postgres(pg) => {
+            let row = sqlx::query(sql)
+                .bind(participant_id)
+                .bind(seed)
+                .bind(difficulty.as_str())
+                .bind(is_human)
+                .bind(show_answer_validation)
+                .bind(initial_item_index)
+                .bind(modality_targets[0].as_str())
+                .bind(modality_targets[1].as_str())
+                .bind(modality_targets[2].as_str())
+                .bind(modality_targets[3].as_str())
+                .bind(modality_targets[4].as_str())
+                .fetch_one(pg)
+                .await
+                .context("failed to insert new session row")?;
+            decode_session_row_pg(&row)
+        }
+        DbPool::Sqlite(sqlite) => {
+            let row = sqlx::query(sql)
+                .bind(participant_id)
+                .bind(seed)
+                .bind(difficulty.as_str())
+                .bind(is_human)
+                .bind(show_answer_validation)
+                .bind(initial_item_index)
+                .bind(modality_targets[0].as_str())
+                .bind(modality_targets[1].as_str())
+                .bind(modality_targets[2].as_str())
+                .bind(modality_targets[3].as_str())
+                .bind(modality_targets[4].as_str())
+                .fetch_one(sqlite)
+                .await
+                .context("failed to insert new session row")?;
+            decode_session_row_sqlite(&row)
+        }
+    }
+}
+
+pub async fn get_session(pool: &DbPool, session_id: i64) -> Result<Option<SessionRecord>> {
+    let sql = if is_postgres(pool) {
+        r#"SELECT
+            session_id,
+            participant_id,
+            seed,
+            difficulty,
+            is_human,
+            show_answer_validation,
+            end_time IS NOT NULL AS end_time_set,
+            current_item_index,
+            completed
+        FROM human_eval_sessions
+        WHERE session_id = $1"#
+    } else {
+        r#"SELECT
+            session_id,
+            participant_id,
+            seed,
+            difficulty,
+            is_human,
+            show_answer_validation,
+            end_time IS NOT NULL AS end_time_set,
+            current_item_index,
+            completed
+        FROM human_eval_sessions
+        WHERE session_id = ?1"#
+    };
+
+    match pool {
+        DbPool::Postgres(pg) => {
+            let row = sqlx::query(sql)
+                .bind(session_id)
+                .fetch_optional(pg)
+                .await
+                .context("failed to read session")?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            Ok(Some(decode_session_row_pg(&row)?))
+        }
+        DbPool::Sqlite(sqlite) => {
+            let row = sqlx::query(sql)
+                .bind(session_id)
+                .fetch_optional(sqlite)
+                .await
+                .context("failed to read session")?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            Ok(Some(decode_session_row_sqlite(&row)?))
+        }
+    }
+}
+
+pub async fn record_answer(
+    pool: &DbPool,
+    session_id: i64,
+    expected_item_index: i32,
+    next_item_index: i32,
+    modality: &str,
+    was_correct: bool,
+) -> Result<SessionRecord> {
+    let (correct_field, wrong_field) = match modality {
+        "image" => ("image_correct", "image_wrong"),
+        "video" => ("video_correct", "video_wrong"),
+        "text" => ("text_correct", "text_wrong"),
+        "tabular" => ("tabular_correct", "tabular_wrong"),
+        "sound" => ("sound_correct", "sound_wrong"),
+        _ => anyhow::bail!("invalid modality '{modality}'"),
+    };
+
+    let now_expr = now_expr(pool);
+    let p1 = placeholder(pool, 1);
+    let p2 = placeholder(pool, 2);
+    let p3 = placeholder(pool, 3);
+    let p4 = placeholder(pool, 4);
+    let p5 = placeholder(pool, 5);
+
+    let query = format!(
+        "UPDATE human_eval_sessions
+            SET
+                current_item_index = {p1},
+                {correct_field} = {correct_field} + {p2},
+                {wrong_field} = {wrong_field} + {p3},
+                end_time = {now_expr},
+                updated_at = {now_expr}
+            WHERE session_id = {p4}
+              AND completed = FALSE
+              AND current_item_index = {p5}
+            RETURNING
+                session_id,
+                participant_id,
+                seed,
+                difficulty,
+                is_human,
+                show_answer_validation,
+                end_time IS NOT NULL AS end_time_set,
+                current_item_index,
+                completed"
+    );
+
+    match pool {
+        DbPool::Postgres(pg) => {
+            let row = sqlx::query(&query)
+                .bind(next_item_index)
+                .bind(if was_correct { 1 } else { 0 })
+                .bind(if was_correct { 0 } else { 1 })
+                .bind(session_id)
+                .bind(expected_item_index)
+                .fetch_one(pg)
+                .await
+                .context("failed to update answer counters for session")?;
+            decode_session_row_pg(&row)
+        }
+        DbPool::Sqlite(sqlite) => {
+            let row = sqlx::query(&query)
+                .bind(next_item_index)
+                .bind(if was_correct { 1 } else { 0 })
+                .bind(if was_correct { 0 } else { 1 })
+                .bind(session_id)
+                .bind(expected_item_index)
+                .fetch_one(sqlite)
+                .await
+                .context("failed to update answer counters for session")?;
+            decode_session_row_sqlite(&row)
+        }
+    }
+}
+
+pub async fn store_ratings(
+    pool: &DbPool,
+    session_id: i64,
+    image_rating: i16,
+    video_rating: i16,
+    text_rating: i16,
+    tabular_rating: i16,
+    sound_rating: i16,
+) -> Result<()> {
+    let now_expr = now_expr(pool);
+    let p1 = placeholder(pool, 1);
+    let p2 = placeholder(pool, 2);
+    let p3 = placeholder(pool, 3);
+    let p4 = placeholder(pool, 4);
+    let p5 = placeholder(pool, 5);
+    let p6 = placeholder(pool, 6);
+
+    let query = format!(
+        "UPDATE human_eval_sessions
+            SET image_difficulty_rating = {p1},
+                video_difficulty_rating = {p2},
+                text_difficulty_rating = {p3},
+                tabular_difficulty_rating = {p4},
+                sound_difficulty_rating = {p5},
+                end_time = {now_expr},
+                completed = TRUE,
+                updated_at = {now_expr}
+            WHERE session_id = {p6}
+              AND completed = FALSE"
+    );
+
+    match pool {
+        DbPool::Postgres(pg) => {
+            let mut tx = pg
+                .begin()
+                .await
+                .context("failed to begin ratings transaction")?;
+
+            let update = sqlx::query(&query)
+                .bind(image_rating)
+                .bind(video_rating)
+                .bind(text_rating)
+                .bind(tabular_rating)
+                .bind(sound_rating)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await
+                .context("failed to write session ratings")?;
+
+            if update.rows_affected() != 1 {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback ratings update")?;
+                anyhow::bail!("session {session_id} was already completed or does not exist");
+            }
+
+            tx.commit()
+                .await
+                .context("failed to commit ratings update")?;
+        }
+        DbPool::Sqlite(sqlite) => {
+            let mut tx = sqlite
+                .begin()
+                .await
+                .context("failed to begin ratings transaction")?;
+
+            let update = sqlx::query(&query)
+                .bind(image_rating)
+                .bind(video_rating)
+                .bind(text_rating)
+                .bind(tabular_rating)
+                .bind(sound_rating)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await
+                .context("failed to write session ratings")?;
+
+            if update.rows_affected() != 1 {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback ratings update")?;
+                anyhow::bail!("session {session_id} was already completed or does not exist");
+            }
+
+            tx.commit()
+                .await
+                .context("failed to commit ratings update")?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn parse_difficulty(value: &str) -> Result<Difficulty> {
+    Difficulty::from_str(value).context("invalid difficulty")
+}
+
+fn create_table_sql(pool: &DbPool) -> &'static str {
+    if is_postgres(pool) {
+        r#"CREATE TABLE IF NOT EXISTS human_eval_sessions (
+            session_id BIGSERIAL PRIMARY KEY,
+            participant_id TEXT NOT NULL,
+            seed BIGINT NOT NULL,
+            difficulty TEXT NOT NULL CHECK (difficulty IN ('easy', 'medium', 'hard')),
+            is_human BOOLEAN NOT NULL,
+            show_answer_validation BOOLEAN NOT NULL,
+            image_target TEXT NOT NULL DEFAULT 'oqp',
+            video_target TEXT NOT NULL DEFAULT 'oqp',
+            text_target TEXT NOT NULL DEFAULT 'oqp',
+            tabular_target TEXT NOT NULL DEFAULT 'oqp',
+            sound_target TEXT NOT NULL DEFAULT 'oqp',
+            end_time TIMESTAMPTZ NULL,
+            current_item_index INTEGER NOT NULL DEFAULT 0,
+            completed BOOLEAN NOT NULL DEFAULT FALSE,
+
+            image_correct INTEGER NOT NULL DEFAULT 0,
+            image_wrong INTEGER NOT NULL DEFAULT 0,
+            video_correct INTEGER NOT NULL DEFAULT 0,
+            video_wrong INTEGER NOT NULL DEFAULT 0,
+            text_correct INTEGER NOT NULL DEFAULT 0,
+            text_wrong INTEGER NOT NULL DEFAULT 0,
+            tabular_correct INTEGER NOT NULL DEFAULT 0,
+            tabular_wrong INTEGER NOT NULL DEFAULT 0,
+            sound_correct INTEGER NOT NULL DEFAULT 0,
+            sound_wrong INTEGER NOT NULL DEFAULT 0,
+
+            image_difficulty_rating SMALLINT CHECK (image_difficulty_rating IS NULL OR image_difficulty_rating BETWEEN 1 AND 5),
+            video_difficulty_rating SMALLINT CHECK (video_difficulty_rating IS NULL OR video_difficulty_rating BETWEEN 1 AND 5),
+            text_difficulty_rating SMALLINT CHECK (text_difficulty_rating IS NULL OR text_difficulty_rating BETWEEN 1 AND 5),
+            tabular_difficulty_rating SMALLINT CHECK (tabular_difficulty_rating IS NULL OR tabular_difficulty_rating BETWEEN 1 AND 5),
+            sound_difficulty_rating SMALLINT CHECK (sound_difficulty_rating IS NULL OR sound_difficulty_rating BETWEEN 1 AND 5),
+
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#
+    } else {
+        r#"CREATE TABLE IF NOT EXISTS human_eval_sessions (
+            session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            participant_id TEXT NOT NULL,
+            seed INTEGER NOT NULL,
+            difficulty TEXT NOT NULL CHECK (difficulty IN ('easy', 'medium', 'hard')),
+            is_human INTEGER NOT NULL,
+            show_answer_validation INTEGER NOT NULL,
+            image_target TEXT NOT NULL DEFAULT 'oqp',
+            video_target TEXT NOT NULL DEFAULT 'oqp',
+            text_target TEXT NOT NULL DEFAULT 'oqp',
+            tabular_target TEXT NOT NULL DEFAULT 'oqp',
+            sound_target TEXT NOT NULL DEFAULT 'oqp',
+            end_time TEXT NULL,
+            current_item_index INTEGER NOT NULL DEFAULT 0,
+            completed INTEGER NOT NULL DEFAULT 0,
+
+            image_correct INTEGER NOT NULL DEFAULT 0,
+            image_wrong INTEGER NOT NULL DEFAULT 0,
+            video_correct INTEGER NOT NULL DEFAULT 0,
+            video_wrong INTEGER NOT NULL DEFAULT 0,
+            text_correct INTEGER NOT NULL DEFAULT 0,
+            text_wrong INTEGER NOT NULL DEFAULT 0,
+            tabular_correct INTEGER NOT NULL DEFAULT 0,
+            tabular_wrong INTEGER NOT NULL DEFAULT 0,
+            sound_correct INTEGER NOT NULL DEFAULT 0,
+            sound_wrong INTEGER NOT NULL DEFAULT 0,
+
+            image_difficulty_rating INTEGER CHECK (image_difficulty_rating IS NULL OR image_difficulty_rating BETWEEN 1 AND 5),
+            video_difficulty_rating INTEGER CHECK (video_difficulty_rating IS NULL OR video_difficulty_rating BETWEEN 1 AND 5),
+            text_difficulty_rating INTEGER CHECK (text_difficulty_rating IS NULL OR text_difficulty_rating BETWEEN 1 AND 5),
+            tabular_difficulty_rating INTEGER CHECK (tabular_difficulty_rating IS NULL OR tabular_difficulty_rating BETWEEN 1 AND 5),
+            sound_difficulty_rating INTEGER CHECK (sound_difficulty_rating IS NULL OR sound_difficulty_rating BETWEEN 1 AND 5),
+
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )"#
+    }
+}
+
+async fn execute(pool: &DbPool, sql: &str) -> Result<()> {
+    match pool {
+        DbPool::Postgres(pg) => {
+            sqlx::query(sql).execute(pg).await?;
+        }
+        DbPool::Sqlite(sqlite) => {
+            sqlx::query(sql).execute(sqlite).await?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_session_row_pg(row: &sqlx::postgres::PgRow) -> Result<SessionRecord> {
+    Ok(SessionRecord {
+        session_id: row.try_get("session_id")?,
+        participant_id: row.try_get("participant_id")?,
+        seed: row.try_get("seed")?,
+        difficulty: row.try_get("difficulty")?,
+        is_human: row.try_get("is_human")?,
+        show_answer_validation: row.try_get("show_answer_validation")?,
+        end_time_set: row.try_get("end_time_set")?,
+        current_item_index: row.try_get("current_item_index")?,
+        completed: row.try_get("completed")?,
+    })
+}
+
+fn decode_session_row_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {
+    Ok(SessionRecord {
+        session_id: row.try_get("session_id")?,
+        participant_id: row.try_get("participant_id")?,
+        seed: row.try_get("seed")?,
+        difficulty: row.try_get("difficulty")?,
+        is_human: row.try_get("is_human")?,
+        show_answer_validation: row.try_get("show_answer_validation")?,
+        end_time_set: row.try_get("end_time_set")?,
+        current_item_index: row.try_get("current_item_index")?,
+        completed: row.try_get("completed")?,
+    })
+}
+
+fn sqlite_url_from_path(path: &str) -> String {
+    if path == ":memory:" {
+        "sqlite::memory:".to_string()
+    } else if path.starts_with("sqlite:") {
+        path.to_string()
+    } else {
+        format!("sqlite://{path}")
+    }
+}
+
+fn is_postgres(pool: &DbPool) -> bool {
+    matches!(pool, DbPool::Postgres(_))
+}
+
+fn now_expr(pool: &DbPool) -> &'static str {
+    if is_postgres(pool) {
+        "NOW()"
+    } else {
+        "CURRENT_TIMESTAMP"
+    }
+}
+
+fn placeholder(pool: &DbPool, index: usize) -> String {
+    if is_postgres(pool) {
+        format!("${index}")
+    } else {
+        format!("?{index}")
+    }
+}

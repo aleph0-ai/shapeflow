@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
 use shapeflow_core::{
-    OrderedQuadrantPassageTarget, SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig,
-    canonical_scene_id, generate_ordered_quadrant_passage_targets, generate_scene,
+    GeneratedTarget, SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig,
+    canonical_scene_id, generate_all_scene_targets, generate_scene,
     generate_scene_text_lines_with_scene_config, generate_tabular_motion_rows,
     render_scene_image_png_with_scene_config, render_scene_sound_wav,
     render_scene_video_frames_png_with_keyframe_border, serialize_scene_text,
-    serialize_tabular_motion_rows_csv, validate_ordered_quadrant_passage_targets,
+    serialize_tabular_motion_rows_csv, validate_generated_targets,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,7 +17,7 @@ struct PreviewReport {
     samples_per_event: usize,
     target_count: usize,
     total_target_segments: usize,
-    hard_target_segments: usize,
+    total_target_values: usize,
     video_frame_count: usize,
 }
 
@@ -111,14 +111,14 @@ fn build_preview_artifacts(
         )?;
     }
 
-    let mut targets = generate_ordered_quadrant_passage_targets(&output)
+    let mut targets = generate_all_scene_targets(&output)
         .with_context(|| format!("target generation failed for scene_index={scene_index}"))?;
-    targets.sort_by_key(|target| target.shape_index);
-    let target_validation = validate_ordered_quadrant_passage_targets(&targets)
+    targets.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    let target_validation = validate_generated_targets(&targets)
         .with_context(|| format!("target validation failed for scene_index={scene_index}"))?;
     let targets_preview_text = render_targets_preview_text(&targets);
     std::fs::write(
-        scene_output_dir.join("targets_oqp.txt").as_std_path(),
+        scene_output_dir.join("targets.txt").as_std_path(),
         targets_preview_text.as_bytes(),
     )
     .with_context(|| format!("failed to write target preview for scene_id={scene_id}"))?;
@@ -128,28 +128,28 @@ fn build_preview_artifacts(
         scene_index,
         output_dir: scene_output_dir,
         samples_per_event,
-        target_count: target_validation.shape_target_count,
+        target_count: target_validation.target_count,
         total_target_segments: target_validation.total_segments,
-        hard_target_segments: target_validation.hard_segment_count,
+        total_target_values: target_validation.total_values,
         video_frame_count: video_frames.len(),
     })
 }
 
-fn render_targets_preview_text(targets: &[OrderedQuadrantPassageTarget]) -> String {
+fn render_targets_preview_text(targets: &[GeneratedTarget]) -> String {
     let mut lines = Vec::new();
     for target in targets {
-        let task_id = format!("oqp{:04}", target.shape_index);
         lines.push(format!(
-            "task_id={task_id},shape_index={},segment_count={}",
-            target.shape_index,
+            "task_id={},segment_count={}",
+            target.task_id,
             target.segments.len()
         ));
         for (segment_index, segment) in target.segments.iter().enumerate() {
-            let components = segment.as_array();
-            lines.push(format!(
-                "segment={segment_index},q1={:.6},q2={:.6},q3={:.6},q4={:.6}",
-                components[0], components[1], components[2], components[3]
-            ));
+            let values = segment
+                .iter()
+                .map(|value| format!("{value:.6}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            lines.push(format!("segment={segment_index},values={values}"));
         }
     }
     lines.join("\n")
@@ -163,14 +163,14 @@ fn print_preview_report(report: &PreviewReport) {
         report.scene_id, report.scene_index, report.samples_per_event
     );
     println!(
-        "target_count={}, total_target_segments={}, hard_target_segments={}, video_frame_count={}",
+        "target_count={}, total_target_segments={}, total_target_values={}, video_frame_count={}",
         report.target_count,
         report.total_target_segments,
-        report.hard_target_segments,
+        report.total_target_values,
         report.video_frame_count
     );
     println!(
-        "artifacts=text.txt,tabular.csv,image.png,sound.wav,targets_oqp.txt,video_frames/frame_XXXXXX.png"
+        "artifacts=text.txt,tabular.csv,image.png,sound.wav,targets.txt,video_frames/frame_XXXXXX.png"
     );
 }
 
@@ -225,8 +225,8 @@ mod tests {
             "preview should write sound.wav"
         );
         assert!(
-            scene_dir.join("targets_oqp.txt").as_std_path().exists(),
-            "preview should write targets_oqp.txt"
+            scene_dir.join("targets.txt").as_std_path().exists(),
+            "preview should write targets.txt"
         );
         let video_frames_dir = scene_dir.join("video_frames");
         assert!(
