@@ -1,0 +1,106 @@
+steps:
+  - name: "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_BUILDER_IMAGE}:latest"
+    id: cargo audit (report-only)
+    entrypoint: bash
+    env:
+      - CARGO_HOME=/workspace/.cargo
+      - XDG_RUNTIME_DIR=/workspace/.xdg
+      - PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+
+        mkdir -p "$$CARGO_HOME" "$$XDG_RUNTIME_DIR"
+
+        if ! cargo audit; then
+          echo "cargo audit reported advisories; continuing because this step is intentionally report-only."
+        fi
+
+  - name: "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_BUILDER_IMAGE}:latest"
+    id: cargo build (sccache + GCS)
+    entrypoint: bash
+    env:
+      - "SCCACHE_GCS_BUCKET=${_SCCACHE_BUCKET}"
+      - SCCACHE_GCS_RW_MODE=READ_WRITE
+      - "SCCACHE_GCS_KEY_PREFIX=${_SCCACHE_KEY_PREFIX}"
+      - SCCACHE_DIR=/workspace/.sccache
+      - CARGO_HOME=/workspace/.cargo
+      - XDG_RUNTIME_DIR=/workspace/.xdg
+      - PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - RUSTC_WRAPPER=/usr/local/bin/sccache
+      - SCCACHE_LOG=info
+      - "RUSTFLAGS=-Ctarget-feature=+crt-static -Ctarget-cpu=x86-64-v3 -Crelocation-model=pic -Clto=fat -Ccodegen-units=1 -Clink-arg=-Wl,-z,relro -Clink-arg=-Wl,-z,now"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+
+        mkdir -p "$$SCCACHE_DIR" "$$CARGO_HOME" "$$XDG_RUNTIME_DIR"
+
+        sccache --start-server || true
+
+        cargo +nightly build \
+          --release \
+          --target x86_64-unknown-linux-musl \
+          --locked \
+          -p shapeflow-cli
+
+        file target/x86_64-unknown-linux-musl/release/shapeflow | grep -Eq 'static-pie linked|statically linked'
+        ldd target/x86_64-unknown-linux-musl/release/shapeflow | tee /workspace/shapeflow.ldd
+        ! grep -q '=> ' /workspace/shapeflow.ldd
+        ! readelf -d target/x86_64-unknown-linux-musl/release/shapeflow | grep -q '(NEEDED)'
+
+        strip target/x86_64-unknown-linux-musl/release/shapeflow || true
+
+        sccache --show-stats || true
+
+  - name: gcr.io/cloud-builders/docker
+    id: docker build runtime image
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        IMAGE_BASE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}"
+        docker build \
+          -f Dockerfile.cloudrun \
+          -t "$${IMAGE_BASE}:$COMMIT_SHA" \
+          -t "$${IMAGE_BASE}:latest" \
+          .
+
+  - name: gcr.io/cloud-builders/docker
+    id: docker push tags
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        IMAGE_BASE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}"
+        docker push "$${IMAGE_BASE}:$COMMIT_SHA"
+        docker push "$${IMAGE_BASE}:latest"
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy cloud run service
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        IMAGE_BASE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}"
+        gcloud run deploy shapeflow \
+          --project "$PROJECT_ID" \
+          --region "${_REGION}" \
+          --image "$${IMAGE_BASE}:latest" \
+          --quiet
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _REGION: europe-west1
+  _REPO: cloud-run-source-deploy
+  _IMAGE: shapeflow
+  _BUILDER_IMAGE: rust-builder
+  _SCCACHE_BUCKET: aleph0-sccache
+  _SCCACHE_KEY_PREFIX: cloudbuild

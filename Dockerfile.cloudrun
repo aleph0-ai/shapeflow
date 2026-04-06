@@ -1,0 +1,28 @@
+FROM docker.io/library/alpine:3.23 AS runtime_prep
+
+RUN set -eux; \
+    apk add --no-cache ca-certificates tzdata; \
+    mkdir -p /out/etc/ssl/certs /out/usr/share /out/tmp; \
+    cp -a /etc/ssl/certs/ca-certificates.crt /out/etc/ssl/certs/; \
+    cp -a /usr/share/zoneinfo /out/usr/share/; \
+    printf 'nonroot:x:65532:65532:nonroot:/:\n' > /out/etc/passwd; \
+    printf 'nonroot:x:65532:\n' > /out/etc/group; \
+    chmod 1777 /out/tmp
+
+FROM scratch
+
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_DIR=/etc/ssl/certs \
+    TZ=UTC \
+    TMPDIR=/tmp
+
+COPY --from=runtime_prep /out/etc /etc
+COPY --from=runtime_prep /out/usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=runtime_prep /out/tmp /tmp
+COPY target/x86_64-unknown-linux-musl/release/shapeflow /shapeflow
+
+USER 65532:65532
+
+EXPOSE 8080
+
+ENTRYPOINT ["/shapeflow", "human-eval", "--bind", "0.0.0.0:8080"]

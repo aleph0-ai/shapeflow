@@ -1,0 +1,27 @@
+name: rollout
+
+on:
+  check_run:
+    types: [completed]
+
+jobs:
+  post_build:
+    permissions:
+      contents: read
+      checks: read
+    if: >
+      github.event.check_run.app.slug == 'google-cloud-build' &&
+      github.event.check_run.conclusion == 'success' &&
+      github.event.check_run.check_suite.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize Cloud Build completion
+        run: |
+          {
+            echo "### Cloud Build completed"
+            echo
+            echo "- Check run: ${{ github.event.check_run.name }}"
+            echo "- SHA: ${{ github.event.check_run.head_sha }}"
+            echo "- Branch: ${{ github.event.check_run.check_suite.head_branch }}"
+            echo "- Details: ${{ github.event.check_run.details_url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
