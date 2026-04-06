@@ -30,7 +30,7 @@ steps:
       - PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - RUSTC_WRAPPER=/usr/local/bin/sccache
       - SCCACHE_LOG=info
-      - "RUSTFLAGS=-Ctarget-feature=+crt-static -Ctarget-cpu=x86-64-v3 -Crelocation-model=pic -Clto=fat -Ccodegen-units=1 -Clink-arg=-Wl,-z,relro -Clink-arg=-Wl,-z,now"
+      - "RUSTFLAGS=-Ctarget-feature=+crt-static -Ctarget-cpu=x86-64-v3 -Crelocation-model=pic -Cembed-bitcode=yes -Clto=fat -Ccodegen-units=1 -Clink-arg=-Wl,-z,relro -Clink-arg=-Wl,-z,now"
     args:
       - "-c"
       - |
