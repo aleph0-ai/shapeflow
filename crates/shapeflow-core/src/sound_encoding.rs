@@ -10,6 +10,7 @@ use crate::tabular_encoding::{
 use libm::{pow, sin};
 
 const PULSE_DUTY_CYCLE: f64 = 0.25;
+const OUTPUT_PEAK_CAP_FRACTION: f64 = 0.70;
 
 #[derive(Clone, Copy)]
 enum SoundShapeWaveform {
@@ -127,7 +128,7 @@ pub fn render_scene_sound_wav(
         events_by_slot[slot].push(event);
     }
 
-    let mut interleaved_samples = Vec::<i16>::new();
+    let mut interleaved_samples = Vec::<f64>::new();
     let channel_count: u16 = match channel_mapping {
         SoundChannelMapping::MonoMix => 1,
         SoundChannelMapping::StereoAlternating => 2,
@@ -187,11 +188,11 @@ pub fn render_scene_sound_wav(
 
             match channel_mapping {
                 SoundChannelMapping::MonoMix => {
-                    interleaved_samples.push(clamp_i16(mono));
+                    interleaved_samples.push(mono);
                 }
                 SoundChannelMapping::StereoAlternating => {
-                    interleaved_samples.push(clamp_i16(left));
-                    interleaved_samples.push(clamp_i16(right));
+                    interleaved_samples.push(left);
+                    interleaved_samples.push(right);
                 }
             }
         }
@@ -203,13 +204,14 @@ pub fn render_scene_sound_wav(
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
+    apply_output_peak_cap(&mut interleaved_samples);
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut writer = hound::WavWriter::new(&mut cursor, spec)
             .map_err(|error| SoundEncodingError::WavEncoding(error.to_string()))?;
         for sample in interleaved_samples {
             writer
-                .write_sample(sample)
+                .write_sample(clamp_i16(sample))
                 .map_err(|error| SoundEncodingError::WavEncoding(error.to_string()))?;
         }
         writer
@@ -301,6 +303,34 @@ fn waveform_sample(shape_waveform: SoundShapeWaveform, phase: f64) -> f64 {
 fn clamp_i16(sample: f64) -> i16 {
     let clamped = sample.clamp(f64::from(i16::MIN), f64::from(i16::MAX));
     clamped as i16
+}
+
+fn peak_cap_value() -> f64 {
+    f64::from(i16::MAX) * OUTPUT_PEAK_CAP_FRACTION
+}
+
+fn apply_output_peak_cap(samples: &mut [f64]) {
+    if samples.is_empty() {
+        return;
+    }
+
+    let cap = peak_cap_value();
+    if cap <= 0.0 {
+        return;
+    }
+
+    let peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f64, f64::max);
+    if peak <= cap {
+        return;
+    }
+
+    let gain = cap / peak;
+    for sample in samples.iter_mut() {
+        *sample *= gain;
+    }
 }
 
 fn lerp(start: f64, end: f64, t: f64) -> f64 {
@@ -415,6 +445,13 @@ mod tests {
         sum / samples.len() as f64
     }
 
+    fn peak_abs_float_sample(samples: &[f64]) -> f64 {
+        samples
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0_f64, f64::max)
+    }
+
     #[test]
     fn render_scene_sound_wav_is_deterministic_for_bootstrap_scene() {
         let config = bootstrap_config();
@@ -461,6 +498,26 @@ mod tests {
         let sample_count = reader.samples::<i16>().count();
         assert!(sample_count > 0);
         assert_eq!(sample_count % usize::from(spec.channels), 0);
+    }
+
+    #[test]
+    fn render_scene_sound_wav_output_peak_is_capped() {
+        let config = bootstrap_config();
+        let scene = bootstrap_scene();
+        let wav_bytes = render_scene_sound_wav(
+            &scene,
+            config.scene.sound_sample_rate_hz,
+            config.scene.sound_frames_per_second,
+            config.scene.sound_modulation_depth_per_mille,
+            config.scene.sound_channel_mapping,
+        )
+        .expect("sound rendering should succeed");
+        let samples = decode_i16_samples(&wav_bytes);
+        let peak = samples
+            .iter()
+            .map(|sample| f64::from(*sample).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(peak <= peak_cap_value() + 1.0);
     }
 
     #[test]
@@ -711,6 +768,28 @@ mod tests {
             mean_abs_sample(&high_samples) > mean_abs_sample(&low_samples) * 1.5,
             "high y should increase sample amplitude"
         );
+    }
+
+    #[test]
+    fn apply_output_peak_cap_does_not_boost_quiet_samples() {
+        let mut quiet_samples = vec![120.0_f64, -300.0, 80.0, -40.0, 300.0];
+        let original = quiet_samples.clone();
+        apply_output_peak_cap(&mut quiet_samples);
+        assert_eq!(quiet_samples, original);
+    }
+
+    #[test]
+    fn apply_output_peak_cap_reduces_loud_samples_to_cap() {
+        let mut loud_samples = vec![
+            f64::from(i16::MAX),
+            f64::from(i16::MIN + 1),
+            20_000.0,
+            -18_000.0,
+        ];
+        apply_output_peak_cap(&mut loud_samples);
+        let peak = peak_abs_float_sample(&loud_samples);
+        assert!(peak <= peak_cap_value() + 1.0e-9);
+        assert!(peak > 0.0);
     }
 
     #[test]

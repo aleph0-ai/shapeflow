@@ -10,13 +10,11 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
-    pub session_id: i64,
-    pub participant_id: String,
+    pub session_id: String,
     pub seed: i64,
     pub difficulty: String,
     pub is_human: bool,
     pub show_answer_validation: bool,
-    pub end_time_set: bool,
     pub current_item_index: i32,
     pub completed: bool,
 }
@@ -124,60 +122,59 @@ pub async fn ensure_schema(pool: &DbPool) -> Result<()> {
 
 pub async fn create_session(
     pool: &DbPool,
-    participant_id: &str,
+    session_id: &str,
     seed: i64,
     difficulty: Difficulty,
     is_human: bool,
     show_answer_validation: bool,
+    identifier: Option<&str>,
     initial_item_index: i32,
     modality_targets: &ModalityTargets,
 ) -> Result<SessionRecord> {
     let sql = if is_postgres(pool) {
         r#"INSERT INTO human_eval_sessions (
-            participant_id,
+            session_id,
             seed,
             difficulty,
             is_human,
             show_answer_validation,
+            identifier,
             current_item_index,
             image_target,
             video_target,
             text_target,
             tabular_target,
             sound_target
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING
             session_id,
-            participant_id,
             seed,
             difficulty,
             is_human,
             show_answer_validation,
-            end_time IS NOT NULL AS end_time_set,
             current_item_index,
             completed"#
     } else {
         r#"INSERT INTO human_eval_sessions (
-            participant_id,
+            session_id,
             seed,
             difficulty,
             is_human,
             show_answer_validation,
+            identifier,
             current_item_index,
             image_target,
             video_target,
             text_target,
             tabular_target,
             sound_target
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         RETURNING
             session_id,
-            participant_id,
             seed,
             difficulty,
             is_human,
             show_answer_validation,
-            end_time IS NOT NULL AS end_time_set,
             current_item_index,
             completed"#
     };
@@ -185,11 +182,12 @@ pub async fn create_session(
     match pool {
         DbPool::Postgres(pg) => {
             let row = sqlx::query(sql)
-                .bind(participant_id)
+                .bind(session_id)
                 .bind(seed)
                 .bind(difficulty.as_str())
                 .bind(is_human)
                 .bind(show_answer_validation)
+                .bind(identifier)
                 .bind(initial_item_index)
                 .bind(modality_targets[0].as_str())
                 .bind(modality_targets[1].as_str())
@@ -203,11 +201,12 @@ pub async fn create_session(
         }
         DbPool::Sqlite(sqlite) => {
             let row = sqlx::query(sql)
-                .bind(participant_id)
+                .bind(session_id)
                 .bind(seed)
                 .bind(difficulty.as_str())
                 .bind(is_human)
                 .bind(show_answer_validation)
+                .bind(identifier)
                 .bind(initial_item_index)
                 .bind(modality_targets[0].as_str())
                 .bind(modality_targets[1].as_str())
@@ -222,16 +221,14 @@ pub async fn create_session(
     }
 }
 
-pub async fn get_session(pool: &DbPool, session_id: i64) -> Result<Option<SessionRecord>> {
+pub async fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<SessionRecord>> {
     let sql = if is_postgres(pool) {
         r#"SELECT
             session_id,
-            participant_id,
             seed,
             difficulty,
             is_human,
             show_answer_validation,
-            end_time IS NOT NULL AS end_time_set,
             current_item_index,
             completed
         FROM human_eval_sessions
@@ -239,12 +236,10 @@ pub async fn get_session(pool: &DbPool, session_id: i64) -> Result<Option<Sessio
     } else {
         r#"SELECT
             session_id,
-            participant_id,
             seed,
             difficulty,
             is_human,
             show_answer_validation,
-            end_time IS NOT NULL AS end_time_set,
             current_item_index,
             completed
         FROM human_eval_sessions
@@ -279,7 +274,7 @@ pub async fn get_session(pool: &DbPool, session_id: i64) -> Result<Option<Sessio
 
 pub async fn record_answer(
     pool: &DbPool,
-    session_id: i64,
+    session_id: &str,
     expected_item_index: i32,
     next_item_index: i32,
     modality: &str,
@@ -307,19 +302,16 @@ pub async fn record_answer(
                 current_item_index = {p1},
                 {correct_field} = {correct_field} + {p2},
                 {wrong_field} = {wrong_field} + {p3},
-                end_time = {now_expr},
                 updated_at = {now_expr}
             WHERE session_id = {p4}
               AND completed = FALSE
               AND current_item_index = {p5}
             RETURNING
                 session_id,
-                participant_id,
                 seed,
                 difficulty,
                 is_human,
                 show_answer_validation,
-                end_time IS NOT NULL AS end_time_set,
                 current_item_index,
                 completed"
     );
@@ -354,7 +346,7 @@ pub async fn record_answer(
 
 pub async fn store_ratings(
     pool: &DbPool,
-    session_id: i64,
+    session_id: &str,
     image_rating: i16,
     video_rating: i16,
     text_rating: i16,
@@ -376,7 +368,6 @@ pub async fn store_ratings(
                 text_difficulty_rating = {p3},
                 tabular_difficulty_rating = {p4},
                 sound_difficulty_rating = {p5},
-                end_time = {now_expr},
                 completed = TRUE,
                 updated_at = {now_expr}
             WHERE session_id = {p6}
@@ -452,18 +443,17 @@ pub fn parse_difficulty(value: &str) -> Result<Difficulty> {
 fn create_table_sql(pool: &DbPool) -> &'static str {
     if is_postgres(pool) {
         r#"CREATE TABLE IF NOT EXISTS human_eval_sessions (
-            session_id BIGSERIAL PRIMARY KEY,
-            participant_id TEXT NOT NULL,
+            session_id TEXT PRIMARY KEY,
             seed BIGINT NOT NULL,
             difficulty TEXT NOT NULL CHECK (difficulty IN ('easy', 'medium', 'hard')),
             is_human BOOLEAN NOT NULL,
             show_answer_validation BOOLEAN NOT NULL,
+            identifier TEXT NULL,
             image_target TEXT NOT NULL DEFAULT 'oqp',
             video_target TEXT NOT NULL DEFAULT 'oqp',
             text_target TEXT NOT NULL DEFAULT 'oqp',
             tabular_target TEXT NOT NULL DEFAULT 'oqp',
             sound_target TEXT NOT NULL DEFAULT 'oqp',
-            end_time TIMESTAMPTZ NULL,
             current_item_index INTEGER NOT NULL DEFAULT 0,
             completed BOOLEAN NOT NULL DEFAULT FALSE,
 
@@ -489,18 +479,17 @@ fn create_table_sql(pool: &DbPool) -> &'static str {
         )"#
     } else {
         r#"CREATE TABLE IF NOT EXISTS human_eval_sessions (
-            session_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            participant_id TEXT NOT NULL,
+            session_id TEXT PRIMARY KEY,
             seed INTEGER NOT NULL,
             difficulty TEXT NOT NULL CHECK (difficulty IN ('easy', 'medium', 'hard')),
             is_human INTEGER NOT NULL,
             show_answer_validation INTEGER NOT NULL,
+            identifier TEXT NULL,
             image_target TEXT NOT NULL DEFAULT 'oqp',
             video_target TEXT NOT NULL DEFAULT 'oqp',
             text_target TEXT NOT NULL DEFAULT 'oqp',
             tabular_target TEXT NOT NULL DEFAULT 'oqp',
             sound_target TEXT NOT NULL DEFAULT 'oqp',
-            end_time TEXT NULL,
             current_item_index INTEGER NOT NULL DEFAULT 0,
             completed INTEGER NOT NULL DEFAULT 0,
 
@@ -542,12 +531,10 @@ async fn execute(pool: &DbPool, sql: &str) -> Result<()> {
 fn decode_session_row_pg(row: &sqlx::postgres::PgRow) -> Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.try_get("session_id")?,
-        participant_id: row.try_get("participant_id")?,
         seed: row.try_get("seed")?,
         difficulty: row.try_get("difficulty")?,
         is_human: row.try_get("is_human")?,
         show_answer_validation: row.try_get("show_answer_validation")?,
-        end_time_set: row.try_get("end_time_set")?,
         current_item_index: row.try_get("current_item_index")?,
         completed: row.try_get("completed")?,
     })
@@ -556,12 +543,10 @@ fn decode_session_row_pg(row: &sqlx::postgres::PgRow) -> Result<SessionRecord> {
 fn decode_session_row_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.try_get("session_id")?,
-        participant_id: row.try_get("participant_id")?,
         seed: row.try_get("seed")?,
         difficulty: row.try_get("difficulty")?,
         is_human: row.try_get("is_human")?,
         show_answer_validation: row.try_get("show_answer_validation")?,
-        end_time_set: row.try_get("end_time_set")?,
         current_item_index: row.try_get("current_item_index")?,
         completed: row.try_get("completed")?,
     })

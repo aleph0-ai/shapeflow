@@ -1,23 +1,43 @@
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gif::{Encoder, Frame, Repeat};
+use hound;
 use shapeflow_core::{
     EasingFamily, MotionEvent, MotionEventAccounting, NormalizedPoint, SceneGenerationOutput,
     ShapeFlowConfig,
     image_encoding::render_scene_image_png_with_scene_config,
     sound_encoding::render_scene_sound_wav,
     tabular_encoding::{
-        generate_tabular_motion_rows, serialize_tabular_motion_rows_csv, shape_identity_for_scene,
+        generate_tabular_motion_rows, serialize_tabular_motion_rows_csv,
+        serialize_tabular_motion_rows_csv_display, shape_identity_for_scene,
     },
     text_encoding::{generate_scene_text_lines_with_scene_config, serialize_scene_text},
     video_encoding::render_scene_video_frames_png_with_keyframe_border,
 };
 
 use crate::flow::{self, Difficulty, Modality, PlanItem};
+use std::io::Cursor;
+
+/// Remove the first line and all lines starting from the first that begins with "Pair ".
+fn trim_text_for_display(text: &str) -> String {
+    let mut lines = text.lines();
+    lines.next(); // skip first line
+    let mut out = String::with_capacity(text.len());
+    for line in lines {
+        if line.starts_with("Pair ") {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
 
 const MAX_VIDEO_PREVIEW_RESOLUTION: u32 = 256;
 const MAX_VIDEO_PLAYER_FRAMES: usize = 180;
 const MAX_VIDEO_GIF_FRAMES: usize = 120;
+const PREVIEW_AUDIO_PEAK_TARGET_FRACTION: f64 = 0.70;
 
 #[derive(Debug, Clone)]
 pub enum TaskStimulus {
@@ -128,16 +148,16 @@ pub fn build_task_stimulus(
             let lines = generate_scene_text_lines_with_scene_config(&scene, &config.scene)
                 .map_err(|error| anyhow::anyhow!("{error}"))
                 .context("failed to render text stimulus")?;
-            Ok(TaskStimulus::Text {
-                body: serialize_scene_text(&lines),
-            })
+            let full_text = serialize_scene_text(&lines);
+            let trimmed = trim_text_for_display(&full_text);
+            Ok(TaskStimulus::Text { body: trimmed })
         }
         Modality::Tabular => {
             let rows = generate_tabular_motion_rows(&scene)
                 .map_err(|error| anyhow::anyhow!("{error}"))
                 .context("failed to render tabular stimulus rows")?;
             Ok(TaskStimulus::TabularCsv {
-                csv: serialize_tabular_motion_rows_csv(&rows),
+                csv: serialize_tabular_motion_rows_csv_display(&rows),
             })
         }
         Modality::Sound => {
@@ -150,6 +170,8 @@ pub fn build_task_stimulus(
             )
             .map_err(|error| anyhow::anyhow!("{error}"))
             .context("failed to render sound stimulus")?;
+            let wav = normalize_preview_wav_peak(&wav)
+                .context("failed to normalize sound WAV before encoding")?;
             let (shape_previews, quadrant_guide_data_uri, transition_previews) =
                 build_sound_guidance(&scene, &config, item)
                     .context("failed to render sound guidance stimuli")?;
@@ -282,6 +304,8 @@ fn build_sound_guidance(
             EasingFamily::Linear,
         )
         .context("failed to render per-shape tone preview")?;
+        let tone = normalize_preview_wav_peak(&tone)
+            .context("failed to normalize per-shape tone preview")?;
         shape_previews.push(SoundShapePreview {
             label: flow::shape_id_to_natural_label(&identity.shape_id),
             image_data_uri: shape_preview_svg_data_uri(&identity.shape_type, &identity.color),
@@ -317,6 +341,8 @@ fn build_sound_guidance(
             EasingFamily::Linear,
         )
         .context("failed to render quadrant transition example audio")?;
+        let audio = normalize_preview_wav_peak(&audio)
+            .context("failed to normalize transition preview audio")?;
         transition_previews.push(SoundTransitionPreview {
             label: label.to_string(),
             audio_data_uri: wav_data_uri(&audio),
@@ -388,6 +414,58 @@ fn render_preview_motion_wav(
     )
     .map_err(|error| anyhow::anyhow!("{error}"))
     .context("preview WAV render failed")
+}
+
+fn normalize_preview_wav_peak(wav_bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut reader = hound::WavReader::new(Cursor::new(wav_bytes))
+        .context("failed to decode WAV preview clip")?;
+    let spec = reader.spec();
+
+    if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
+        return Err(anyhow::anyhow!(
+            "unsupported WAV format for preview normalization (expects int16): {:?}, {} bits",
+            spec.sample_format,
+            spec.bits_per_sample
+        ));
+    }
+
+    let mut samples = Vec::with_capacity(reader.len() as usize);
+    let mut peak = 0.0_f64;
+    for sample in reader.samples::<i16>() {
+        let sample = sample.context("failed to decode WAV sample for preview normalization")?;
+        peak = peak.max(f64::from(sample).abs());
+        samples.push(sample);
+    }
+
+    if peak == 0.0 {
+        return Ok(wav_bytes.to_vec());
+    }
+
+    let target_peak = PREVIEW_AUDIO_PEAK_TARGET_FRACTION * f64::from(i16::MAX);
+    let gain = target_peak / peak;
+
+    let mut normalized = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let scaled = (f64::from(sample) * gain).round();
+        let clamped = scaled.clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
+        normalized.push(clamped);
+    }
+
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer =
+            hound::WavWriter::new(&mut cursor, spec).context("failed to create WAV writer")?;
+        for sample in normalized {
+            writer
+                .write_sample(sample)
+                .context("failed to write normalized WAV sample")?;
+        }
+        writer
+            .finalize()
+            .context("failed to finalize normalized WAV preview")?;
+    }
+
+    Ok(cursor.into_inner())
 }
 
 fn shape_preview_svg_data_uri(shape_type: &str, color: &str) -> String {
@@ -576,4 +654,88 @@ fn svg_data_uri(svg: &str) -> String {
 
 fn wav_data_uri(bytes: &[u8]) -> String {
     format!("data:audio/wav;base64,{}", STANDARD.encode(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_i16_wav(samples: &[i16], channels: u16, sample_rate: u32) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer =
+                hound::WavWriter::new(&mut cursor, spec).expect("failed to create test WAV writer");
+            for sample in samples {
+                writer
+                    .write_sample(*sample)
+                    .expect("failed to write test WAV sample");
+            }
+            writer.finalize().expect("failed to finalize test WAV");
+        }
+        cursor.into_inner()
+    }
+
+    fn wav_peak_i16(wav_bytes: &[u8]) -> i32 {
+        let mut reader =
+            hound::WavReader::new(Cursor::new(wav_bytes)).expect("failed to parse WAV");
+        reader
+            .samples::<i16>()
+            .map(|sample| sample.expect("failed to read WAV sample"))
+            .map(i32::from)
+            .map(i32::abs)
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn normalize_preview_wav_peak_preserves_format_and_length() {
+        let input = encode_i16_wav(&[0, 1000, -2000, 3000, -4000, 5000], 2, 44_100);
+        let output = normalize_preview_wav_peak(&input).expect("normalization failed");
+
+        let input_reader =
+            hound::WavReader::new(Cursor::new(&input)).expect("failed to decode input WAV");
+        let output_reader =
+            hound::WavReader::new(Cursor::new(&output)).expect("failed to decode output WAV");
+
+        assert_eq!(input_reader.spec().channels, output_reader.spec().channels);
+        assert_eq!(
+            input_reader.spec().sample_rate,
+            output_reader.spec().sample_rate
+        );
+        assert_eq!(
+            input_reader.spec().bits_per_sample,
+            output_reader.spec().bits_per_sample
+        );
+        assert_eq!(
+            input_reader.spec().sample_format,
+            output_reader.spec().sample_format
+        );
+        assert_eq!(input_reader.len(), output_reader.len());
+    }
+
+    #[test]
+    fn normalize_preview_wav_peak_raises_quiet_clip_level_to_target() {
+        let sample_count = 16_384_usize;
+        let sample_rate = 44_100;
+        let quiet_input = encode_i16_wav(&vec![250_i16; sample_count], 1, sample_rate);
+        let loud_input = encode_i16_wav(&vec![12_000_i16; sample_count], 1, sample_rate);
+
+        let quiet_before = wav_peak_i16(&quiet_input) as f64;
+        let loud_before = wav_peak_i16(&loud_input) as f64;
+        let quiet_after =
+            wav_peak_i16(&normalize_preview_wav_peak(&quiet_input).expect("normalize")) as f64;
+        let loud_after =
+            wav_peak_i16(&normalize_preview_wav_peak(&loud_input).expect("normalize")) as f64;
+
+        assert!(loud_before / quiet_before > 20.0);
+        assert!(quiet_after >= 0.68 * f64::from(i16::MAX));
+        assert!(loud_after >= 0.68 * f64::from(i16::MAX));
+        assert!(loud_after / quiet_after < 1.05);
+    }
 }

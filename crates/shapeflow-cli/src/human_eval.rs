@@ -10,6 +10,7 @@ pub fn run_human_eval(
     db_user: Option<String>,
     db_password: Option<String>,
     db_name: Option<String>,
+    debug: bool,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -28,6 +29,7 @@ pub fn run_human_eval(
     let config = HumanEvalServerConfig {
         bind_addr: bind,
         database,
+        debug,
     };
 
     runtime.block_on(run_server(config))

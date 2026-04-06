@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="100%" height="100%">
+  <defs>
+    <!-- Vibrant Gradient for the Full Main Wave (Lighter Top Half) -->
+    <linearGradient id="topWaveGrad" x1="180" y1="210" x2="480" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3ebde6"/>
+      <stop offset="50%" stop-color="#64d4f2"/>
+      <stop offset="100%" stop-color="#9bf2ff"/>
+    </linearGradient>
+
+    <!-- Deep Gradient for the Darker Bottom Half of the Wave -->
+    <linearGradient id="bottomWaveGrad" x1="180" y1="230" x2="480" y2="160" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0c435c"/>
+      <stop offset="50%" stop-color="#1d7f9c"/>
+      <stop offset="100%" stop-color="#2ca1c4"/>
+    </linearGradient>
+
+    <!-- Gradient for the Upper Curve -->
+    <linearGradient id="upperCurveGrad" x1="280" y1="150" x2="540" y2="90" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6cd7f0"/>
+      <stop offset="100%" stop-color="#b8f4ff"/>
+    </linearGradient>
+  </defs>
+
+  <g id="logo-mark">
+    <!-- Restored Complex Diamond Frame (16-facet 3D look with no strokes) -->
+    <g id="diamond-frame">
+      <!-- Top-Left Quadrant -->
+      <polygon points="125,210 225,110 190,160" fill="#3299b6" />
+      <polygon points="225,110 225,160 190,160" fill="#50bedb" />
+      <polygon points="125,210 190,160 175,210" fill="#2b8da8" />
+      <polygon points="175,210 190,160 225,160" fill="#155e7a" />
+
+      <!-- Top-Right Quadrant (Highlighted) -->
+      <polygon points="225,110 325,210 260,160" fill="#56bcd6" />
+      <polygon points="225,110 260,160 225,160" fill="#8de0f0" />
+      <polygon points="325,210 275,210 260,160" fill="#4aaec9" />
+      <polygon points="275,210 225,160 260,160" fill="#2488a8" />
+
+      <!-- Bottom-Left Quadrant -->
+      <polygon points="125,210 175,210 190,260" fill="#207f9e" />
+      <polygon points="175,210 225,260 190,260" fill="#1a6785" />
+      <polygon points="125,210 190,260 225,310" fill="#146385" />
+      <polygon points="225,310 190,260 225,260" fill="#0c4763" />
+
+      <!-- Bottom-Right Quadrant (Lightened to contrast with dark wave) -->
+      <polygon points="325,210 260,260 275,210" fill="#3ba3c7" />
+      <polygon points="275,210 260,260 225,260" fill="#5ec7de" />
+      <polygon points="325,210 225,310 260,260" fill="#48b2d1" />
+      <polygon points="225,310 225,260 260,260" fill="#2a8fba" />
+    </g>
+
+    <!-- Split Main Flowy Curve -->
+    <!-- Base Layer: The FULL wave shape using the lighter gradient. -->
+    <path d="M 185 205
+          C 230 265, 280 265, 320 225
+          C 360 185, 380 145, 440 140
+          C 470 138, 500 150, 520 185
+          C 490 135, 460 115, 420 115
+          C 360 115, 320 170, 280 200
+          C 240 230, 210 225, 185 205 Z"
+          fill="url(#topWaveGrad)"/>
+
+    <!-- Overlay Layer: The Bottom (Darker) Half exactly tracing the lower region with distinct inner edge. -->
+    <path d="M 185 205
+          C 230 265, 280 265, 320 225
+          C 360 185, 380 145, 440 140
+          C 470 138, 500 150, 520 185
+          C 495 142, 465 126, 430 130
+          C 375 135, 350 175, 310 212
+          C 270 245, 220 240, 185 205 Z"
+          fill="url(#bottomWaveGrad)"/>
+    </g>
+
+    <!-- TYPOGRAPHY -->
+    <text x="355" y="235"
+          font-family="system-ui, -apple-system, 'Nunito', 'Segoe UI Rounded', 'Arial Rounded MT Bold', sans-serif"
+          font-weight="700"
+          font-size="68"
+          fill="#444749"
+          letter-spacing="-1"
+          style="font-variant-ligatures: none;">shapeflow</text>
+
+    </svg>

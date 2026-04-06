@@ -3,9 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Result, anyhow};
 use axum::{
     Router,
-    extract::{Form, Json, State},
-    http::StatusCode,
-    response::Html,
+    extract::{Form, Json, Path, State},
+    http::{StatusCode, header},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use rand::random;
@@ -27,15 +27,23 @@ struct AppState {
 }
 
 #[derive(Debug, Clone)]
+struct CachedTaskArtifacts {
+    plan_item: flow::PlanItem,
+    stimulus: stimulus::TaskStimulus,
+}
+
+#[derive(Debug, Clone)]
 struct RuntimeSession {
     seed: u64,
     difficulty: Difficulty,
     is_human: bool,
     show_answer_validation: bool,
+    identifier: Option<String>,
     modality_targets: flow::ModalityTargets,
     current_item_index: usize,
+    cached_task: Option<CachedTaskArtifacts>,
     awaiting_proceed: bool,
-    db_session_id: Option<i64>,
+    db_session_id: Option<String>,
     completed: bool,
 }
 
@@ -44,6 +52,7 @@ struct SetupPayload {
     is_human: bool,
     difficulty: String,
     show_answer_validation: Option<bool>,
+    identifier: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -89,16 +98,35 @@ pub async fn run_server(config: HumanEvalServerConfig) -> Result<()> {
 
     let _ = tracing_subscriber::fmt::try_init();
 
-    let router = Router::new()
-        .route("/", get(index_route))
+    let index_handler = if config.debug {
+        tracing::info!("debug mode enabled \u{2014} stimulus navigator at /");
+        get(debug_index_route)
+    } else {
+        get(index_route)
+    };
+
+    let mut router = Router::new()
+        .route("/", index_handler)
         .route("/start", post(start_route))
         .route("/events", post(submit_route))
         .route("/proceed", post(proceed_route))
         .route("/ratings", post(ratings_route))
+        .route("/static/style.css", get(css_route))
+        .route("/static/app.js", get(js_route))
+        .route("/static/shapeflow.svg", get(logo_route))
+        .route("/data/:seed/:difficulty/:modality/:index", get(data_route))
         .route("/favicon.ico", get(favicon_route))
         .route("/healthz", get(health_route))
-        .nest_service("/mcp", mcp_service)
-        .with_state(app_state);
+        .nest_service("/mcp", mcp_service);
+
+    if config.debug {
+        router = router.route(
+            "/debug/:difficulty/:modality/:task/:role",
+            get(debug_preview_route),
+        );
+    }
+
+    let router = router.with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
@@ -149,6 +177,10 @@ async fn start_route(
 
     let mut sessions = state.sessions.lock().await;
     let session_uuid = generate_session_uuid(&sessions);
+    let cached_task = CachedTaskArtifacts {
+        plan_item: first_item.clone(),
+        stimulus: first_stimulus.clone(),
+    };
     sessions.insert(
         session_uuid,
         RuntimeSession {
@@ -156,8 +188,10 @@ async fn start_route(
             difficulty: setup.difficulty,
             is_human: setup.is_human,
             show_answer_validation: setup.show_answer_validation,
+            identifier: setup.identifier,
             modality_targets,
             current_item_index: 0,
+            cached_task: Some(cached_task),
             awaiting_proceed: false,
             db_session_id: None,
             completed: false,
@@ -165,10 +199,10 @@ async fn start_route(
     );
     drop(sessions);
 
-    let ai_native_sample_url = if setup.is_human {
+    let ai_native_info = if setup.is_human {
         None
     } else {
-        Some(build_ai_native_sample_url(
+        Some(build_ai_native_info(
             setup.session_seed,
             setup.difficulty,
             &first_item,
@@ -182,7 +216,8 @@ async fn start_route(
             &first_stimulus,
             0,
             None,
-            ai_native_sample_url.as_deref(),
+            ai_native_info.as_ref(),
+            setup.show_answer_validation,
         )
         .into_string(),
     )
@@ -224,13 +259,11 @@ async fn submit_route(
         );
     }
 
-    let expected_plan = match flow::build_plan_item(
-        runtime.seed,
-        runtime.difficulty,
-        &runtime.modality_targets,
-        expected_index,
-    ) {
-        Ok(plan) => plan,
+    let CachedTaskArtifacts {
+        plan_item: expected_plan,
+        stimulus: current_stimulus,
+    } = match cache_or_rebuild_task_artifacts(runtime, expected_index) {
+        Ok(value) => value,
         Err(error) => {
             return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
         }
@@ -281,7 +314,7 @@ async fn submit_route(
             }
         };
 
-        let session_id = match runtime.db_session_id {
+        let session_id = match runtime.db_session_id.clone() {
             Some(value) => value,
             None => {
                 let session_seed_i64 = match i64::try_from(runtime.seed) {
@@ -301,6 +334,7 @@ async fn submit_route(
                     runtime.difficulty,
                     runtime.is_human,
                     runtime.show_answer_validation,
+                    runtime.identifier.as_deref(),
                     expected_index_i32,
                     &runtime.modality_targets,
                 )
@@ -314,12 +348,12 @@ async fn submit_route(
                     }
                 };
 
-                runtime.db_session_id = Some(created.session_id);
+                runtime.db_session_id = Some(created.session_id.clone());
                 created.session_id
             }
         };
 
-        if let Some(db_session) = match db::get_session(&state.pool, session_id).await {
+        if let Some(db_session) = match db::get_session(&state.pool, &session_id).await {
             Ok(Some(value)) => Some(value),
             Ok(None) => None,
             Err(error) => {
@@ -340,7 +374,7 @@ async fn submit_route(
 
         if let Err(error) = db::record_answer(
             &state.pool,
-            session_id,
+            &session_id,
             payload_index_i32,
             next_index_i32,
             expected_plan.modality.as_str(),
@@ -355,22 +389,10 @@ async fn submit_route(
     runtime.current_item_index = next_index;
     runtime.awaiting_proceed = true;
 
-    let current_stimulus = match stimulus::build_task_stimulus(
-        runtime.seed,
-        runtime.difficulty,
-        &expected_plan,
-        runtime.is_human,
-    ) {
-        Ok(stimulus) => stimulus,
-        Err(error) => {
-            return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
-        }
-    };
-
-    let ai_native_sample_url = if runtime.is_human {
+    let ai_native_info = if runtime.is_human {
         None
     } else {
-        Some(build_ai_native_sample_url(
+        Some(build_ai_native_info(
             runtime.seed,
             runtime.difficulty,
             &expected_plan,
@@ -383,8 +405,9 @@ async fn submit_route(
             &expected_plan,
             &current_stimulus,
             expected_index,
-            Some((is_correct, feedback)),
-            ai_native_sample_url.as_deref(),
+            Some((is_correct, feedback, payload.answer_text.clone())),
+            ai_native_info.as_ref(),
+            runtime.show_answer_validation,
         )
         .into_string(),
     )
@@ -420,33 +443,20 @@ async fn proceed_route(
         return Html(crate::views::render_ratings_fragment(&session_uuid).into_string());
     }
 
-    let next_plan = match flow::build_plan_item(
-        runtime.seed,
-        runtime.difficulty,
-        &runtime.modality_targets,
-        next_index,
-    ) {
-        Ok(plan) => plan,
-        Err(error) => {
-            return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
-        }
-    };
-    let next_stimulus = match stimulus::build_task_stimulus(
-        runtime.seed,
-        runtime.difficulty,
-        &next_plan,
-        runtime.is_human,
-    ) {
-        Ok(stimulus) => stimulus,
+    let CachedTaskArtifacts {
+        plan_item: next_plan,
+        stimulus: next_stimulus,
+    } = match cache_or_rebuild_task_artifacts(runtime, next_index) {
+        Ok(value) => value,
         Err(error) => {
             return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
         }
     };
 
-    let ai_native_sample_url = if runtime.is_human {
+    let ai_native_info = if runtime.is_human {
         None
     } else {
-        Some(build_ai_native_sample_url(
+        Some(build_ai_native_info(
             runtime.seed,
             runtime.difficulty,
             &next_plan,
@@ -460,7 +470,8 @@ async fn proceed_route(
             &next_stimulus,
             next_index,
             None,
-            ai_native_sample_url.as_deref(),
+            ai_native_info.as_ref(),
+            runtime.show_answer_validation,
         )
         .into_string(),
     )
@@ -482,7 +493,7 @@ async fn ratings_route(
             crate::views::render_error_fragment(
                 "ratings must use each integer 1 through 5 exactly once (1 easiest, 5 hardest)",
             )
-                .into_string(),
+            .into_string(),
         );
     }
 
@@ -504,7 +515,7 @@ async fn ratings_route(
         );
     }
 
-    let Some(session_id) = runtime.db_session_id else {
+    let Some(session_id) = runtime.db_session_id.clone() else {
         return Html(
             crate::views::render_error_fragment("no scored answers were recorded for this session")
                 .into_string(),
@@ -513,7 +524,7 @@ async fn ratings_route(
 
     match db::store_ratings(
         &state.pool,
-        session_id,
+        &session_id,
         payload.image_difficulty_rating,
         payload.video_difficulty_rating,
         payload.text_difficulty_rating,
@@ -528,6 +539,164 @@ async fn ratings_route(
         }
         Err(error) => Html(crate::views::render_error_fragment(&error.to_string()).into_string()),
     }
+}
+
+async fn css_route() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/static/style.css")),
+    )
+        .into_response()
+}
+
+async fn js_route() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/static/app.js")),
+    )
+        .into_response()
+}
+
+async fn logo_route() -> Response {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/static/shapeflow.svg")),
+    )
+        .into_response()
+}
+
+async fn data_route(
+    Path((seed, difficulty, modality, index)): Path<(u64, String, String, u32)>,
+) -> Response {
+    let difficulty = match Difficulty::from_str(&difficulty) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+    };
+
+    let modality = match flow::Modality::from_str(&modality.to_ascii_lowercase()) {
+        Some(value) => value,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid modality; expected image|video|text|tabular|sound",
+            )
+                .into_response();
+        }
+    };
+
+    let payload = match stimulus::build_ai_native_sample(seed, difficulty, modality, index) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    match payload {
+        stimulus::NativeSamplePayload::Text { mime_type, text } => {
+            ([(header::CONTENT_TYPE, mime_type)], text).into_response()
+        }
+        stimulus::NativeSamplePayload::Binary { mime_type, bytes } => {
+            ([(header::CONTENT_TYPE, mime_type)], bytes).into_response()
+        }
+    }
+}
+
+async fn debug_index_route() -> Html<String> {
+    Html(crate::views::render_debug_navigator().into_string())
+}
+
+async fn debug_preview_route(
+    State(state): State<AppState>,
+    Path((difficulty, modality, task, role)): Path<(String, String, String, String)>,
+) -> Response {
+    let difficulty = match Difficulty::from_str(&difficulty) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let modality = match flow::Modality::from_str(&modality.to_ascii_lowercase()) {
+        Some(v) => v,
+        None => {
+            return (StatusCode::BAD_REQUEST, "invalid modality").into_response();
+        }
+    };
+    let target = match flow::QuestionTarget::from_str(&task) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid task; expected oqp|xct|zqh|lme",
+            )
+                .into_response();
+        }
+    };
+    let is_human = role != "ai";
+    let seed: u64 = 42;
+
+    // Compute item_index for the first non-practice scene of this modality.
+    let modality_index = flow::modality_order_index(modality);
+    let item_index =
+        modality_index * flow::SCENES_PER_MODALITY_TOTAL + flow::PRACTICE_SCENES_PER_MODALITY;
+
+    // Override the target for this modality to the one requested.
+    let mut modality_targets = flow::modality_targets_from_seed(seed);
+    modality_targets[modality_index] = target;
+    let item = match flow::build_plan_item(seed, difficulty, &modality_targets, item_index) {
+        Ok(item) => item,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let stim = match stimulus::build_task_stimulus(seed, difficulty, &item, is_human) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let cached_task = CachedTaskArtifacts {
+        plan_item: item.clone(),
+        stimulus: stim.clone(),
+    };
+
+    let session_uuid = Uuid::now_v7();
+    let mut sessions = state.sessions.lock().await;
+    sessions.insert(
+        session_uuid,
+        RuntimeSession {
+            seed,
+            difficulty,
+            is_human,
+            show_answer_validation: true,
+            identifier: None,
+            modality_targets,
+            current_item_index: item_index,
+            cached_task: Some(cached_task),
+            awaiting_proceed: false,
+            db_session_id: None,
+            completed: false,
+        },
+    );
+    drop(sessions);
+
+    let ai_native_info = if is_human {
+        None
+    } else {
+        Some(build_ai_native_info(seed, difficulty, &item))
+    };
+
+    Html(
+        crate::views::render_task_page(
+            &session_uuid.to_string(),
+            &item,
+            &stim,
+            item_index,
+            None,
+            ai_native_info.as_ref(),
+            true,
+        )
+        .into_string(),
+    )
+    .into_response()
 }
 
 async fn health_route() -> &'static str {
@@ -620,10 +789,18 @@ fn prepare_setup(payload: &SetupPayload) -> Result<SetupPayloadState> {
     let difficulty = Difficulty::from_str(&payload.difficulty)?;
     let session_seed = random::<u64>() & MAX_SAFE_MCP_SEED;
 
+    let identifier = payload
+        .identifier
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
     Ok(SetupPayloadState {
         difficulty,
         is_human: payload.is_human,
         show_answer_validation: payload.show_answer_validation.unwrap_or(false),
+        identifier,
         session_seed,
     })
 }
@@ -635,6 +812,43 @@ fn generate_session_uuid(sessions: &HashMap<Uuid, RuntimeSession>) -> Uuid {
             return session_uuid;
         }
     }
+}
+
+fn cache_or_rebuild_task_artifacts(
+    runtime: &mut RuntimeSession,
+    item_index: usize,
+) -> Result<CachedTaskArtifacts> {
+    if let Some(cached) = runtime.cached_task.as_ref()
+        && cached.plan_item.item_index == item_index
+    {
+        return Ok(cached.clone());
+    }
+
+    let plan_item = flow::build_plan_item(
+        runtime.seed,
+        runtime.difficulty,
+        &runtime.modality_targets,
+        item_index,
+    )
+    .map_err(|error| {
+        anyhow!("failed to rebuild plan item for session item_index={item_index}: {error}")
+    })?;
+    let stimulus = stimulus::build_task_stimulus(
+        runtime.seed,
+        runtime.difficulty,
+        &plan_item,
+        runtime.is_human,
+    )
+    .map_err(|error| {
+        anyhow!("failed to rebuild stimulus for session item_index={item_index}: {error}")
+    })?;
+
+    let cached = CachedTaskArtifacts {
+        plan_item: plan_item.clone(),
+        stimulus: stimulus.clone(),
+    };
+    runtime.cached_task = Some(cached.clone());
+    Ok(cached)
 }
 
 fn valid_unique_rating_permutation(values: [i16; 5]) -> bool {
@@ -652,14 +866,29 @@ fn valid_unique_rating_permutation(values: [i16; 5]) -> bool {
     true
 }
 
-fn build_ai_native_sample_url(seed: u64, difficulty: Difficulty, item: &flow::PlanItem) -> String {
-    format!(
-        "seed={seed} difficulty={difficulty} modality={modality} idx={idx}",
-        seed = seed,
-        difficulty = difficulty.as_str(),
-        modality = item.modality.as_str(),
-        idx = item.scene_index,
-    )
+fn build_ai_native_info(seed: u64, difficulty: Difficulty, item: &flow::PlanItem) -> AiNativeInfo {
+    AiNativeInfo {
+        tool_args: format!(
+            "seed={seed} difficulty={difficulty} modality={modality} idx={idx}",
+            seed = seed,
+            difficulty = difficulty.as_str(),
+            modality = item.modality.as_str(),
+            idx = item.scene_index,
+        ),
+        data_url: format!(
+            "/data/{seed}/{difficulty}/{modality}/{idx}",
+            seed = seed,
+            difficulty = difficulty.as_str(),
+            modality = item.modality.as_str(),
+            idx = item.scene_index,
+        ),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AiNativeInfo {
+    pub tool_args: String,
+    pub data_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -667,6 +896,7 @@ struct SetupPayloadState {
     difficulty: Difficulty,
     is_human: bool,
     show_answer_validation: bool,
+    identifier: Option<String>,
     session_seed: u64,
 }
 
@@ -681,6 +911,7 @@ mod tests {
                 is_human: false,
                 difficulty: "easy".to_string(),
                 show_answer_validation: None,
+                identifier: None,
             };
             let setup = prepare_setup(&payload).expect("setup should be valid");
             assert!(setup.session_seed <= MAX_SAFE_MCP_SEED);
@@ -698,5 +929,61 @@ mod tests {
         assert!(!valid_unique_rating_permutation([1, 1, 3, 4, 5]));
         assert!(!valid_unique_rating_permutation([0, 2, 3, 4, 5]));
         assert!(!valid_unique_rating_permutation([1, 2, 3, 4, 6]));
+    }
+
+    #[test]
+    fn cached_task_artifacts_rebuilds_when_missing_or_stale() {
+        let mut runtime = RuntimeSession {
+            seed: 1337,
+            difficulty: Difficulty::Easy,
+            is_human: true,
+            show_answer_validation: false,
+            identifier: None,
+            modality_targets: [
+                flow::QuestionTarget::OrderedQuadrantPassage,
+                flow::QuestionTarget::CrossingCount,
+                flow::QuestionTarget::QuadrantAfterMoves,
+                flow::QuestionTarget::LargestMotionShape,
+                flow::QuestionTarget::OrderedQuadrantPassage,
+            ],
+            current_item_index: 0,
+            cached_task: None,
+            awaiting_proceed: false,
+            db_session_id: None,
+            completed: false,
+        };
+
+        let first = cache_or_rebuild_task_artifacts(&mut runtime, 0)
+            .expect("first cache rebuild should succeed");
+        assert_eq!(first.plan_item.item_index, 0);
+        assert_eq!(
+            runtime
+                .cached_task
+                .as_ref()
+                .expect("cache should be populated")
+                .plan_item
+                .item_index,
+            0
+        );
+
+        let second =
+            cache_or_rebuild_task_artifacts(&mut runtime, 0).expect("cache hit should succeed");
+        assert_eq!(second.plan_item.item_index, 0);
+        assert_eq!(second.plan_item.scene_index, first.plan_item.scene_index);
+
+        runtime.current_item_index = 3;
+        let next_index = runtime.current_item_index;
+        let third = cache_or_rebuild_task_artifacts(&mut runtime, next_index)
+            .expect("stale cache should be rebuilt");
+        assert_eq!(third.plan_item.item_index, 3);
+        assert_eq!(
+            runtime
+                .cached_task
+                .as_ref()
+                .expect("cache should be updated")
+                .plan_item
+                .item_index,
+            3
+        );
     }
 }

@@ -298,34 +298,53 @@ pub fn generate_tabular_motion_rows(
     Ok(rows)
 }
 
+/// Round to 3 decimal places, away from zero.
+fn round_away(v: f64) -> f64 {
+    let factor = 1000.0;
+    let scaled = v * factor;
+    if v >= 0.0 {
+        scaled.ceil() / factor
+    } else {
+        scaled.floor() / factor
+    }
+}
+
 pub fn serialize_tabular_motion_rows_csv(rows: &[TabularMotionRow]) -> String {
+    serialize_tabular_csv_inner(rows, true)
+}
+
+pub fn serialize_tabular_motion_rows_csv_display(rows: &[TabularMotionRow]) -> String {
+    serialize_tabular_csv_inner(rows, false)
+}
+
+fn serialize_tabular_csv_inner(rows: &[TabularMotionRow], include_scene_id: bool) -> String {
     let mut csv = String::new();
-    csv.push_str("scene_id,event_index,shape_type,color,start_x,start_y,end_x,end_y,simultaneous_event_ids\n");
+    if include_scene_id {
+        csv.push_str("scene_id,");
+    }
+    csv.push_str("event_index,shape_type,color,start_x,start_y,end_x,end_y,simultaneous_events\n");
     for row in rows {
-        let simultaneous_event_ids = row
-            .simultaneous_event_ids
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        let mut sorted_event_ids = simultaneous_event_ids;
+        let mut sorted_event_ids = row.simultaneous_event_ids.clone();
         sorted_event_ids.sort_unstable();
-        let simultaneous_event_ids = sorted_event_ids
+        let simultaneous_events = sorted_event_ids
             .into_iter()
-            .map(|event_id| format!("{event_id:04}"))
+            .map(|event_id| event_id.to_string())
             .collect::<Vec<_>>()
             .join("|");
+        if include_scene_id {
+            write!(csv, "{},", row.scene_id).expect("writing to String must succeed");
+        }
         writeln!(
             csv,
-            "{},{},{},{},{:.17},{:.17},{:.17},{:.17},{}",
-            row.scene_id,
+            "{},{},{},{:.3},{:.3},{:.3},{:.3},{}",
             row.event_index,
             row.shape_type,
             row.color,
-            row.start_x,
-            row.start_y,
-            row.end_x,
-            row.end_y,
-            simultaneous_event_ids
+            round_away(row.start_x),
+            round_away(row.start_y),
+            round_away(row.end_x),
+            round_away(row.end_y),
+            simultaneous_events
         )
         .expect("writing to String must succeed");
     }
@@ -421,12 +440,12 @@ mod tests {
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(
             lines[0],
-            "scene_id,event_index,shape_type,color,start_x,start_y,end_x,end_y,simultaneous_event_ids"
+            "scene_id,event_index,shape_type,color,start_x,start_y,end_x,end_y,simultaneous_events"
         );
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[1],
-            "00000000000000000000000000000000,0,circle,red,-0.25000000000000000,0.50000000000000000,0.25000000000000000,-0.50000000000000000,0007|0012"
+            "00000000000000000000000000000000,0,circle,red,-0.250,0.500,0.250,-0.500,7|12"
         );
     }
 

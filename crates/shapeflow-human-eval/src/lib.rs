@@ -15,6 +15,7 @@ pub enum HumanEvalDatabaseConfig {
 pub struct HumanEvalServerConfig {
     pub bind_addr: String,
     pub database: HumanEvalDatabaseConfig,
+    pub debug: bool,
 }
 
 pub async fn run_server(config: HumanEvalServerConfig) -> anyhow::Result<()> {

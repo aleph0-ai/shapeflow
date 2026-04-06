@@ -124,9 +124,7 @@ pub fn generate_scene_targets_for_index(
         projection: SceneProjectionMode::SoftQuadrants,
     };
     let scene = generate_scene(&params)?;
-    let mut targets = generate_all_scene_targets(&scene)?;
-    targets.sort_by(|left, right| left.task_id.cmp(&right.task_id));
-    Ok(targets)
+    generate_all_scene_targets(&scene).map_err(SceneTargetGenerationError::TargetGeneration)
 }
 
 pub fn expected_target_task_ids(shape_count: usize) -> Vec<String> {

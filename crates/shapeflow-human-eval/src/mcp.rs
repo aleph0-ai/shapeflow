@@ -1,11 +1,12 @@
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::{
+    ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         AnnotateAble, CallToolResult, Content, RawAudioContent, RawContent, ResourceContents,
         ServerCapabilities, ServerInfo,
     },
-    schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
+    schemars, tool, tool_handler, tool_router,
 };
 
 use crate::{flow, flow::Difficulty, stimulus};
@@ -75,11 +76,13 @@ impl HumanEvalMcpServer {
                 } else if mime_type.starts_with("image/") {
                     vec![Content::image(blob, mime_type)]
                 } else if mime_type.starts_with("audio/") {
-                    vec![RawContent::Audio(RawAudioContent {
-                        data: blob,
-                        mime_type,
-                    })
-                    .no_annotation()]
+                    vec![
+                        RawContent::Audio(RawAudioContent {
+                            data: blob,
+                            mime_type,
+                        })
+                        .no_annotation(),
+                    ]
                 } else {
                     vec![Content::resource(
                         ResourceContents::blob(blob, sample_uri).with_mime_type(mime_type),

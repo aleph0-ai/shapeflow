@@ -472,6 +472,7 @@ fn render_time_slot_frame_motion_and_axes(
     let padding_i32 = i32::try_from(padding).expect("panel padding must fit i32");
     let inner_size = (thumbnail_size_i32 - 2 * padding_i32).max(1);
     let inner_u32 = u32::try_from(inner_size).expect("inner size must fit u32");
+    let mut markers = Vec::with_capacity(panel.event_indices.len());
 
     for &event_index in &panel.event_indices {
         let event = scene
@@ -499,16 +500,30 @@ fn render_time_slot_frame_motion_and_axes(
         draw_line_thick(canvas, start.0, start.1, end.0, end.1, *color, TRAIL_STROKE);
         let marker_radius =
             marker_radius_for_shape(marker_radius_for_size(inner_u32), shape_type.as_str());
-        draw_shape_geometry(
+        markers.push((event.shape_index, end.0, end.1, marker_radius));
+    }
+
+    for (shape_index, center_x, center_y, radius) in &markers {
+        let (color, shape_type) = &shape_styles[*shape_index];
+        draw_shape_fill(
             canvas,
-            end.0,
-            end.1,
-            marker_radius,
+            *center_x,
+            *center_y,
+            *radius,
             *color,
             shape_type.as_str(),
         );
-        let dot_color = inverse_color(*color);
-        draw_filled_circle(canvas, end.0, end.1, 1, dot_color);
+    }
+
+    for (shape_index, center_x, center_y, radius) in &markers {
+        let (_, shape_type) = &shape_styles[*shape_index];
+        draw_shape_outline(
+            canvas,
+            *center_x,
+            *center_y,
+            *radius,
+            shape_type.as_str(),
+        );
     }
 
     let axis_box_size = thumbnail_size_i32;
@@ -519,6 +534,13 @@ fn render_time_slot_frame_motion_and_axes(
         axis_box_size,
         AXIS_STROKE,
     );
+
+    for (shape_index, center_x, center_y, _) in &markers {
+        let (color, _) = &shape_styles[*shape_index];
+        let dot_color = inverse_color(*color);
+        draw_filled_circle(canvas, *center_x, *center_y, 1, dot_color);
+    }
+
     draw_axes_in_box_with_style(
         canvas,
         placement.origin_x,
@@ -570,7 +592,7 @@ fn draw_connectors(
             }
         }
         ImageArrowType::Next => {
-            for i in 0..frame_infos.len() - 1 {
+            for i in (0..frame_infos.len() - 1).rev() {
                 let src = frame_infos[i].anchor;
                 let dst = frame_infos[i + 1].anchor;
                 draw_arrow(canvas, src.0, src.1, dst.0, dst.1, color, CONNECTOR_STROKE);
@@ -742,10 +764,20 @@ fn draw_shape_geometry(
     color: Rgb<u8>,
     shape_type: &str,
 ) {
-    let outline = Rgb([0, 0, 0]);
+    draw_shape_fill(canvas, center_x, center_y, radius, color, shape_type);
+    draw_shape_outline(canvas, center_x, center_y, radius, shape_type);
+}
+
+fn draw_shape_fill(
+    canvas: &mut RgbImage,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+    color: Rgb<u8>,
+    shape_type: &str,
+) {
     match shape_type {
         "circle" => {
-            draw_filled_circle(canvas, center_x, center_y, radius + 1, outline);
             draw_filled_circle(canvas, center_x, center_y, radius, color);
         }
         "triangle" => {
@@ -757,25 +789,21 @@ fn draw_shape_geometry(
                 -core::f64::consts::FRAC_PI_2,
             );
             draw_filled_polygon(canvas, &points, color);
-            draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
         }
         "square" => {
             let points =
                 regular_polygon_points(center_x, center_y, radius, 4, core::f64::consts::FRAC_PI_4);
             draw_filled_polygon(canvas, &points, color);
-            draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
         }
         "pentagon" => {
             let points =
                 regular_polygon_points(center_x, center_y, radius, 5, -core::f64::consts::PI / 2.0);
             draw_filled_polygon(canvas, &points, color);
-            draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
         }
         "hexagon" => {
             let points =
                 regular_polygon_points(center_x, center_y, radius, 6, -core::f64::consts::PI / 2.0);
             draw_filled_polygon(canvas, &points, color);
-            draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
         }
         "star" => {
             let mut points = Vec::with_capacity(10);
@@ -791,11 +819,67 @@ fn draw_shape_geometry(
                 points.push((x, y));
             }
             draw_filled_polygon(canvas, &points, color);
+        }
+        _ => {
+            draw_filled_circle(canvas, center_x, center_y, radius, color);
+        }
+    }
+}
+
+fn draw_shape_outline(
+    canvas: &mut RgbImage,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+    shape_type: &str,
+) {
+    let outline = Rgb([0, 0, 0]);
+    match shape_type {
+        "circle" => {
+            draw_circle_outline(canvas, center_x, center_y, radius, outline, SHAPE_OUTLINE_STROKE);
+        }
+        "triangle" => {
+            let points = regular_polygon_points(
+                center_x,
+                center_y,
+                radius,
+                3,
+                -core::f64::consts::FRAC_PI_2,
+            );
+            draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
+        }
+        "square" => {
+            let points =
+                regular_polygon_points(center_x, center_y, radius, 4, core::f64::consts::FRAC_PI_4);
+            draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
+        }
+        "pentagon" => {
+            let points =
+                regular_polygon_points(center_x, center_y, radius, 5, -core::f64::consts::PI / 2.0);
+            draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
+        }
+        "hexagon" => {
+            let points =
+                regular_polygon_points(center_x, center_y, radius, 6, -core::f64::consts::PI / 2.0);
+            draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
+        }
+        "star" => {
+            let mut points = Vec::with_capacity(10);
+            let outer = f64::from(radius);
+            let inner = outer * 0.45;
+            let cx = center_x as f64;
+            let cy = center_y as f64;
+            for i in 0..10 {
+                let angle = -core::f64::consts::PI / 2.0 + core::f64::consts::PI / 5.0 * (i as f64);
+                let r = if i % 2 == 0 { outer } else { inner };
+                let x = (cx + r * angle.cos()).round() as i32;
+                let y = (cy + r * angle.sin()).round() as i32;
+                points.push((x, y));
+            }
             draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
         }
         _ => {
-            draw_filled_circle(canvas, center_x, center_y, radius + 1, outline);
-            draw_filled_circle(canvas, center_x, center_y, radius, color);
+            draw_circle_outline(canvas, center_x, center_y, radius, outline, SHAPE_OUTLINE_STROKE);
         }
     }
 }
@@ -932,6 +1016,29 @@ fn draw_polygon_outline(canvas: &mut RgbImage, points: &[(i32, i32)], color: Rgb
         let a = points[i];
         let b = points[(i + 1) % points.len()];
         draw_line_thick(canvas, a.0, a.1, b.0, b.1, color, stroke);
+    }
+}
+
+fn draw_circle_outline(
+    canvas: &mut RgbImage,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+    color: Rgb<u8>,
+    stroke: i32,
+) {
+    let outer_radius = radius.max(1);
+    let inner_radius = (outer_radius - stroke.max(1)).max(0);
+    let outer_sq = outer_radius * outer_radius;
+    let inner_sq = inner_radius * inner_radius;
+
+    for dy in -outer_radius..=outer_radius {
+        for dx in -outer_radius..=outer_radius {
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq <= outer_sq && dist_sq >= inner_sq {
+                set_pixel_if_in_bounds(canvas, center_x + dx, center_y + dy, color);
+            }
+        }
     }
 }
 

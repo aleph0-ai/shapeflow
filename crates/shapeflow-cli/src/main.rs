@@ -196,6 +196,9 @@ enum Command {
         /// PostgreSQL database name (fallback source if --database-url is omitted).
         #[arg(long)]
         db_name: Option<String>,
+        /// Enable debug mode with a stimulus preview navigator at /.
+        #[arg(long, default_value_t = false)]
+        debug: bool,
     },
 }
 
@@ -298,6 +301,7 @@ fn main() -> Result<()> {
             db_user,
             db_password,
             db_name,
+            debug,
         } => run_human_eval(
             bind,
             sqlite_path,
@@ -307,6 +311,7 @@ fn main() -> Result<()> {
             db_user,
             db_password,
             db_name,
+            debug,
         ),
     }
 }

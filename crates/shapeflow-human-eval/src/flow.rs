@@ -12,9 +12,12 @@ use shapeflow_core::{
 
 pub const PRACTICE_SCENES_PER_MODALITY: usize = 2;
 pub const REAL_SCENES_PER_MODALITY: usize = 5;
-const SCENES_PER_MODALITY: usize = PRACTICE_SCENES_PER_MODALITY + REAL_SCENES_PER_MODALITY;
+pub const SCENES_PER_MODALITY_TOTAL: usize =
+    PRACTICE_SCENES_PER_MODALITY + REAL_SCENES_PER_MODALITY;
+const SCENES_PER_MODALITY: usize = SCENES_PER_MODALITY_TOTAL;
 const SAMPLES_PER_EVENT: usize = 24;
 const MODALITY_TARGET_SEED_MIX: u64 = 0xA71F_C0DE_5EED_0145;
+const LARGEST_EVENT_DISTANCE_TIE_TOLERANCE: f64 = 1.0e-12;
 
 const MODALITY_ORDER: [Modality; 5] = [
     Modality::Image,
@@ -57,6 +60,27 @@ pub enum QuestionTarget {
     LargestMotionShape,
 }
 
+impl QuestionTarget {
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "oqp" => Some(Self::OrderedQuadrantPassage),
+            "xct" => Some(Self::CrossingCount),
+            "zqh" => Some(Self::QuadrantAfterMoves),
+            "lme" => Some(Self::LargestMotionShape),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OrderedQuadrantPassage => "Ordered Quadrant Passage",
+            Self::CrossingCount => "Crossing Count",
+            Self::QuadrantAfterMoves => "Quadrant After Moves",
+            Self::LargestMotionShape => "Largest Motion Shape",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedAnswer {
     Sequence(Vec<usize>),
@@ -74,6 +98,12 @@ pub enum AnswerKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct ShapeChoice {
+    pub shape_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PlanItem {
     pub item_index: usize,
     pub modality: Modality,
@@ -85,6 +115,10 @@ pub struct PlanItem {
     pub answer_kind: AnswerKind,
     pub answer_hint: String,
     pub expected_answer: ExpectedAnswer,
+    /// All shapes present in the scene, for shape-identity selector UI.
+    pub scene_shapes: Vec<ShapeChoice>,
+    /// Upper bound for integer answers (e.g. crossing count), for slider UI.
+    pub integer_max: u32,
 }
 
 #[derive(Debug)]
@@ -216,6 +250,13 @@ impl AnswerKind {
     }
 }
 
+pub fn modality_order_index(modality: Modality) -> usize {
+    MODALITY_ORDER
+        .iter()
+        .position(|m| *m == modality)
+        .unwrap_or(0)
+}
+
 pub fn total_items() -> usize {
     MODALITY_ORDER.len() * SCENES_PER_MODALITY
 }
@@ -286,7 +327,7 @@ pub fn build_plan_item(
     item_index: usize,
 ) -> Result<PlanItem, FlowError> {
     let config = build_session_config(seed, difficulty)?;
-    build_plan_item_from_config(&config, modality_targets, item_index)
+    build_plan_item_from_config(&config, modality_targets, item_index, SAMPLES_PER_EVENT)
 }
 
 pub fn build_scene_for_seed(
@@ -338,7 +379,7 @@ pub fn parse_sequence(raw: &str) -> Result<Vec<usize>, FlowError> {
     for token in raw.split(',') {
         let token = token.trim();
         if token.is_empty() {
-            return Err(FlowError::InvalidFormAnswer(raw.to_string()));
+            continue;
         }
         let quadrant = token
             .parse::<usize>()
@@ -437,6 +478,7 @@ fn build_plan_item_from_config(
     config: &ShapeFlowConfig,
     modality_targets: &ModalityTargets,
     item_index: usize,
+    samples_per_event: usize,
 ) -> Result<PlanItem, FlowError> {
     let modality_index = item_index / SCENES_PER_MODALITY;
     let local_index = item_index % SCENES_PER_MODALITY;
@@ -472,18 +514,28 @@ fn build_plan_item_from_config(
     .map_err(|error| FlowError::ShapeIdentity(error.to_string()))?;
     let query_shape_label = shape_id_to_natural_label(&query_identity.shape_id);
 
-    let generated_targets =
-        generate_scene_targets_for_index(config, u64::from(scene_index), SAMPLES_PER_EVENT)
-            .map_err(|error| FlowError::CoreGeneration(error.to_string()))?;
-    let target_by_id = generated_targets
-        .into_iter()
-        .map(|target| (target.task_id, target.segments))
-        .collect::<BTreeMap<_, _>>();
+    let target_by_id = match target {
+        QuestionTarget::LargestMotionShape => None,
+        _ => {
+            let generated_targets =
+                generate_scene_targets_for_index(config, u64::from(scene_index), samples_per_event)
+                    .map_err(|error| FlowError::CoreGeneration(error.to_string()))?;
+            Some(
+                generated_targets
+                    .into_iter()
+                    .map(|target| (target.task_id, target.segments))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        }
+    };
 
     let build_task_id = |prefix: &str| format!("{prefix}{query_shape_index:04}");
 
     let (prompt, answer_kind, answer_hint, expected_answer, query_shape) = match target {
         QuestionTarget::OrderedQuadrantPassage => {
+            let target_by_id = target_by_id.as_ref().ok_or_else(|| {
+                FlowError::CoreGeneration("missing generated targets".to_string())
+            })?;
             let task_id = build_task_id("oqp");
             let segments =
                 target_by_id
@@ -512,6 +564,9 @@ fn build_plan_item_from_config(
             )
         }
         QuestionTarget::CrossingCount => {
+            let target_by_id = target_by_id.as_ref().ok_or_else(|| {
+                FlowError::CoreGeneration("missing generated targets".to_string())
+            })?;
             let task_id = build_task_id("xct");
             let value = scalar_target_value(&target_by_id, &task_id)?;
             (
@@ -526,6 +581,9 @@ fn build_plan_item_from_config(
             )
         }
         QuestionTarget::QuadrantAfterMoves => {
+            let target_by_id = target_by_id.as_ref().ok_or_else(|| {
+                FlowError::CoreGeneration("missing generated targets".to_string())
+            })?;
             let task_id = build_task_id("zqh");
             let (move_count, quadrant_zero_based) = zqh_target_values(&target_by_id, &task_id)?;
             (
@@ -540,12 +598,41 @@ fn build_plan_item_from_config(
             )
         }
         QuestionTarget::LargestMotionShape => {
-            let task_id = String::from("lme0000");
-            let winning_rank = scalar_target_value(&target_by_id, &task_id)?;
-            let winning_rank_u8 =
-                u8::try_from(winning_rank).map_err(|_| FlowError::TargetPayloadMalformed {
-                    task_id: task_id.clone(),
-                })?;
+            let scene = build_scene_for_index(config, scene_index)?;
+            let mut canonical_ranks = Vec::with_capacity(shape_count);
+            for shape_index in 0..shape_count {
+                let rank = canonical_class_rank_for_scene_seed(
+                    scene_layout_seed,
+                    shape_identity_assignment,
+                    shape_index,
+                )
+                .map_err(|error| FlowError::ShapeIdentity(error.to_string()))?;
+                canonical_ranks.push(rank);
+            }
+            let fallback_rank = canonical_ranks.iter().copied().min().unwrap_or(0u8);
+            let mut best_distance_squared = -1.0_f64;
+            let mut winning_rank = fallback_rank;
+            for event in &scene.motion_events {
+                let dx = event.end_point.x - event.start_point.x;
+                let dy = event.end_point.y - event.start_point.y;
+                let distance_squared = dx * dx + dy * dy;
+                let rank = canonical_ranks
+                    .get(event.shape_index)
+                    .copied()
+                    .unwrap_or(fallback_rank);
+
+                if distance_squared > best_distance_squared + LARGEST_EVENT_DISTANCE_TIE_TOLERANCE {
+                    best_distance_squared = distance_squared;
+                    winning_rank = rank;
+                    continue;
+                }
+                if (distance_squared - best_distance_squared).abs()
+                    <= LARGEST_EVENT_DISTANCE_TIE_TOLERANCE
+                    && rank < winning_rank
+                {
+                    winning_rank = rank;
+                }
+            }
 
             let mut winning_shape_id: Option<String> = None;
             for shape_index in 0..shape_count {
@@ -555,7 +642,7 @@ fn build_plan_item_from_config(
                     shape_index,
                 )
                 .map_err(|error| FlowError::ShapeIdentity(error.to_string()))?;
-                if rank == winning_rank_u8 {
+                if rank == winning_rank {
                     let identity = shape_identity_for_scene_seed(
                         scene_layout_seed,
                         shape_identity_assignment,
@@ -581,6 +668,17 @@ fn build_plan_item_from_config(
         }
     };
 
+    let scene_shapes = (0..shape_count)
+        .filter_map(|i| {
+            shape_identity_for_scene_seed(scene_layout_seed, shape_identity_assignment, i)
+                .ok()
+                .map(|id| ShapeChoice {
+                    label: shape_id_to_natural_label(&id.shape_id),
+                    shape_id: id.shape_id,
+                })
+        })
+        .collect();
+
     Ok(PlanItem {
         item_index,
         modality,
@@ -592,6 +690,8 @@ fn build_plan_item_from_config(
         answer_kind,
         answer_hint,
         expected_answer,
+        scene_shapes,
+        integer_max: config.scene.n_motion_slots * 2,
     })
 }
 
@@ -662,4 +762,33 @@ fn dominant_quadrant(values: &[f64]) -> usize {
     }
 
     winner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_plan_item_lme_does_not_require_target_generation_preconditions() {
+        let config = build_session_config(1337, Difficulty::Easy).expect("config should be valid");
+        let modality_targets = [
+            QuestionTarget::LargestMotionShape,
+            QuestionTarget::OrderedQuadrantPassage,
+            QuestionTarget::LargestMotionShape,
+            QuestionTarget::LargestMotionShape,
+            QuestionTarget::LargestMotionShape,
+        ];
+
+        let lme_item = build_plan_item_from_config(&config, &modality_targets, 0, 0)
+            .expect("lme items should be independent of target-generation samples");
+        assert_eq!(lme_item.target, QuestionTarget::LargestMotionShape);
+
+        let target_item_error =
+            build_plan_item_from_config(&config, &modality_targets, SCENES_PER_MODALITY, 0)
+                .expect_err("target tasks should still require target generation samples");
+        assert!(
+            matches!(target_item_error, FlowError::CoreGeneration(_)),
+            "expected core-generation failure when samples_per_event is zero"
+        );
+    }
 }

@@ -56,7 +56,8 @@ pub use split_assignments::{
 pub use tabular_encoding::{
     ShapeIdentity, TabularEncodingError, TabularMotionRow, canonical_class_count,
     canonical_class_rank_for_scene_seed, canonical_class_value_for_scene_seed, canonical_scene_id,
-    generate_tabular_motion_rows, serialize_tabular_motion_rows_csv, shape_identity_for_index,
+    generate_tabular_motion_rows, serialize_tabular_motion_rows_csv,
+    serialize_tabular_motion_rows_csv_display, shape_identity_for_index,
 };
 pub use target_generation::{
     GeneratedTarget, GeneratedTargetValidationReport, OrderedQuadrantPassageTarget,
