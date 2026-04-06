@@ -11,20 +11,22 @@ use shapeflow_core::{
         generate_tabular_motion_rows, serialize_tabular_motion_rows_csv,
         serialize_tabular_motion_rows_csv_display, shape_identity_for_scene,
     },
-    text_encoding::{generate_scene_text_lines_with_scene_config, serialize_scene_text},
+    text_encoding::{
+        generate_scene_text_lines_with_scene_config_and_profile, serialize_scene_text,
+    },
     video_encoding::render_scene_video_frames_png_with_keyframe_border,
 };
 
 use crate::flow::{self, Difficulty, Modality, PlanItem};
 use std::io::Cursor;
 
-/// Remove the first line and all lines starting from the first that begins with "Pair ".
-fn trim_text_for_display(text: &str) -> String {
+/// Remove the first line; optionally keep or drop Pair lines for display.
+fn trim_text_for_display(text: &str, include_pairs: bool) -> String {
     let mut lines = text.lines();
     lines.next(); // skip first line
     let mut out = String::with_capacity(text.len());
     for line in lines {
-        if line.starts_with("Pair ") {
+        if !include_pairs && line.starts_with("Pair ") {
             break;
         }
         out.push_str(line);
@@ -145,11 +147,16 @@ pub fn build_task_stimulus(
             }
         }
         Modality::Text => {
-            let lines = generate_scene_text_lines_with_scene_config(&scene, &config.scene)
-                .map_err(|error| anyhow::anyhow!("{error}"))
-                .context("failed to render text stimulus")?;
+            let profile = flow::text_alteration_profile_for_difficulty(difficulty);
+            let lines = generate_scene_text_lines_with_scene_config_and_profile(
+                &scene,
+                &config.scene,
+                profile,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .context("failed to render text stimulus")?;
             let full_text = serialize_scene_text(&lines);
-            let trimmed = trim_text_for_display(&full_text);
+            let trimmed = trim_text_for_display(&full_text, is_human);
             Ok(TaskStimulus::Text { body: trimmed })
         }
         Modality::Tabular => {
@@ -229,9 +236,14 @@ pub fn build_ai_native_sample(
             })
         }
         Modality::Text => {
-            let lines = generate_scene_text_lines_with_scene_config(&scene, &config.scene)
-                .map_err(|error| anyhow::anyhow!("{error}"))
-                .context("failed to render native text sample")?;
+            let profile = flow::text_alteration_profile_for_difficulty(difficulty);
+            let lines = generate_scene_text_lines_with_scene_config_and_profile(
+                &scene,
+                &config.scene,
+                profile,
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .context("failed to render native text sample")?;
             Ok(NativeSamplePayload::Text {
                 mime_type: "text/plain; charset=utf-8".to_string(),
                 text: serialize_scene_text(&lines),
@@ -272,7 +284,7 @@ fn build_config_and_scene(
     let config = flow::build_session_config(seed, difficulty)
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("failed to build session config")?;
-    let scene = flow::build_scene_for_index(&config, scene_index)
+    let scene = flow::build_scene_for_seed(seed, difficulty, scene_index)
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("failed to generate scene")?;
     Ok((config, scene))
@@ -737,5 +749,47 @@ mod tests {
         assert!(quiet_after >= 0.68 * f64::from(i16::MAX));
         assert!(loud_after >= 0.68 * f64::from(i16::MAX));
         assert!(loud_after / quiet_after < 1.05);
+    }
+
+    #[test]
+    fn trim_text_for_display_keeps_pair_lines_for_human_mode() {
+        let input = "\
+Scene 00000000 events=2
+Event 0000: alpha
+Event 0001: beta
+Pair 00-01: relation
+Pair 01-00: relation
+";
+
+        let human = trim_text_for_display(input, true);
+        let ai = trim_text_for_display(input, false);
+
+        assert!(human.contains("Pair 00-01: relation"));
+        assert!(human.contains("Pair 01-00: relation"));
+        assert!(!human.contains("Scene 00000000 events=2"));
+
+        assert!(!ai.contains("Pair 00-01: relation"));
+        assert!(!ai.contains("Pair 01-00: relation"));
+        assert!(ai.contains("Event 0000: alpha"));
+        assert!(!ai.contains("Scene 00000000 events=2"));
+    }
+
+    #[test]
+    fn build_config_and_scene_uses_seed_mapped_scene_index() {
+        let seed = (1u64 << 17) + 42;
+        let difficulty = Difficulty::Hard;
+        let scene_index = 7u32;
+
+        let (_config, mapped_scene) =
+            build_config_and_scene(seed, difficulty, scene_index).expect("scene should build");
+        let expected_scene =
+            flow::build_scene_for_seed(seed, difficulty, scene_index).expect("scene should build");
+        let raw_config =
+            flow::build_session_config(seed, difficulty).expect("session config should build");
+        let raw_scene = flow::build_scene_for_index(&raw_config, scene_index)
+            .expect("raw scene should build");
+
+        assert_eq!(mapped_scene, expected_scene);
+        assert_ne!(mapped_scene.scene_index, raw_scene.scene_index);
     }
 }

@@ -12,8 +12,16 @@ ImageArrowType = Literal["prev", "current", "next"]
 AxisNonlinearity = Literal["sigmoid", "tanh"]
 
 
+class ConfigIdentity(TypedDict):
+    config_hash: str
+    generation_profile: str | None
+    generation_profile_version: int | None
+
+
 class DatasetIdentity(TypedDict):
     master_seed: int
+    dataset_version_major: int
+    dataset_version_minor: int
     config_hash: str
     generation_profile: str | None
     generation_profile_version: int | None
@@ -227,6 +235,7 @@ class ShapeFlowConfig:
 
     def to_toml_string(self) -> str: ...
     def write_toml(self, path: str) -> None: ...
+    def config_identity(self) -> ConfigIdentity: ...
     def dataset_identity(self) -> DatasetIdentity: ...
 
     def scene_resolution(self) -> int: ...
@@ -319,6 +328,7 @@ class ShapeFlowBridge:
 
     @staticmethod
     def from_config(config: ShapeFlowConfig) -> ShapeFlowBridge: ...
+    def config_identity(self) -> ConfigIdentity: ...
     def dataset_identity(self) -> DatasetIdentity: ...
 
     def generate_scene(
@@ -361,6 +371,7 @@ class ShapeFlowBridge:
     ) -> MaterializationSummary: ...
 
 
+def config_identity(config_path: str) -> ConfigIdentity: ...
 def dataset_identity(config_path: str) -> DatasetIdentity: ...
 def generate_scene(
     config_path: str,

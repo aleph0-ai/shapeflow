@@ -335,7 +335,6 @@ audio { width: 100%; height: 40px; border-radius: var(--radius-md); }
 /* Sound quadrant diagram */
 .sound-quadrant-diagram {
     position: relative;
-    /* grid = 160px (80+80), margin = 64px each side */
     width: 288px; height: 288px;
     margin: -10px auto -10px;
     overflow: visible;
@@ -351,24 +350,12 @@ audio { width: 100%; height: 40px; border-radius: var(--radius-md); }
     box-sizing: border-box; border-color: var(--slate-700);
 }
 .sq-arrow-line, .sq-arrow-tip { display: none; }
-
-/*
- * Geometry (all integers, no subpixel):
- *   container = 288x288
- *   grid = 160x160 at inset 64px  →  grid edges at 64px and 224px
- *   margin = 64px each side, center at 32px from edge
- *   body = 6px thick  →  cross offset = 32-3 = 29px
- *   tip = 8px deep, 12px wide (6+6)  →  cross offset = -3px
- *   tip side shortened 8px (72px), tail flush to grid edge (64px)
- *   play btn = 32px border-box  →  16px from edge, 128px along axis
- */
 .sq-arrow { position: absolute; background: var(--slate-800); }
 .sq-arrow::after {
     content: ""; position: absolute;
     background: var(--slate-800);
 }
 
-/* Top: 1->2, LEFT-pointing. Tail at right grid edge, tip at left grid edge. */
 .sq-arrow-top {
     top: 29px; left: 70px; right: 64px; height: 6px;
 }
@@ -378,7 +365,6 @@ audio { width: 100%; height: 40px; border-radius: var(--radius-md); }
     clip-path: polygon(0% 50%, 100% 0%, 100% 100%);
 }
 
-/* Bottom: 3->4, RIGHT-pointing. Tail at left grid edge, tip at right grid edge. */
 .sq-arrow-bottom {
     bottom: 29px; left: 64px; right: 70px; height: 6px;
 }
@@ -388,7 +374,6 @@ audio { width: 100%; height: 40px; border-radius: var(--radius-md); }
     clip-path: polygon(100% 50%, 0% 0%, 0% 100%);
 }
 
-/* Left: 2->3, DOWN-pointing. Tail at top grid edge, tip at bottom grid edge. */
 .sq-arrow-left-side {
     left: 29px; top: 64px; bottom: 70px; width: 6px;
 }
@@ -398,7 +383,6 @@ audio { width: 100%; height: 40px; border-radius: var(--radius-md); }
     clip-path: polygon(50% 100%, 0% 0%, 100% 0%);
 }
 
-/* Right: 4->1, UP-pointing. Tail at bottom grid edge, tip at top grid edge. */
 .sq-arrow-right-side {
     right: 29px; top: 70px; bottom: 64px; width: 6px;
 }
@@ -408,7 +392,6 @@ audio { width: 100%; height: 40px; border-radius: var(--radius-md); }
     clip-path: polygon(50% 0%, 0% 100%, 100% 100%);
 }
 
-/* Play buttons — centered on arrow line, at grid midpoint */
 .sq-play-btn {
     width: 32px; height: 32px; border-radius: 50%;
     box-sizing: border-box;
@@ -432,7 +415,7 @@ audio { width: 100%; height: 40px; border-radius: var(--radius-md); }
 .sq-play-left   { left: 16px;   top: 128px; }
 .sq-play-right  { right: 16px;  top: 128px; }
 
-/* AI native access */
+/* Access controls */
 .ai-native-box {
     border: 1px solid var(--slate-200); border-radius: var(--radius-md);
     background: var(--slate-50);
@@ -646,7 +629,6 @@ form[data-proceed-submit] { display: grid; justify-items: center; }
 }
 .feedback-icon { font-size: 1rem; }
 
-/* Inline feedback (no layout shift) */
 .inline-feedback {
     display: block; text-align: center; font-weight: 600; font-size: 0.88rem;
     margin-top: 0.4rem;

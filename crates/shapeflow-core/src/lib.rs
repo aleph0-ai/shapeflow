@@ -24,9 +24,10 @@ pub use artifact_serialization::{
     serialize_target_artifact,
 };
 pub use config::{
-    AxisNonlinearityFamily, CURRENT_SCHEMA_VERSION, DatasetIdentity, EasingFamily,
-    GenerationProfileConfig, ImageArrowType, ParallelismConfig, PositionalLandscapeConfig,
-    SceneConfig, ShapeFlowConfig, ShapeFlowConfigPreset, SoundChannelMapping, TextReferenceFrame,
+    AxisNonlinearityFamily, CURRENT_SCHEMA_VERSION, ConfigIdentity, DatasetIdentity, EasingFamily,
+    GenerationProfileConfig, ImageArrowType, MAX_MASTER_SEED_EXCLUSIVE, ParallelismConfig,
+    PositionalLandscapeConfig, SceneConfig, ShapeFlowConfig, ShapeFlowConfigPreset,
+    SoundChannelMapping, TextReferenceFrame,
 };
 pub use image_encoding::{
     ImageEncodingError, render_scene_image_png, render_scene_image_png_with_scene_config,

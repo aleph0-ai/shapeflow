@@ -184,7 +184,14 @@ fn render_frame_png(
         let center = normalized_to_pixel(x, y, resolution);
         let (color, shape_type) = &shape_styles[shape_index];
         let radius = marker_radius_for_shape(marker_radius(resolution), shape_type.as_str());
-        draw_shape_fill(&mut canvas, center.0, center.1, radius, *color, shape_type.as_str());
+        draw_shape_fill(
+            &mut canvas,
+            center.0,
+            center.1,
+            radius,
+            *color,
+            shape_type.as_str(),
+        );
         draw_shape_outline(&mut canvas, center.0, center.1, radius, shape_type.as_str());
     }
     draw_axes(&mut canvas);
@@ -387,7 +394,14 @@ fn draw_shape_outline(
     let outline = Rgb([0, 0, 0]);
     match shape_type {
         "circle" => {
-            draw_circle_outline(canvas, center_x, center_y, radius, outline, SHAPE_OUTLINE_STROKE);
+            draw_circle_outline(
+                canvas,
+                center_x,
+                center_y,
+                radius,
+                outline,
+                SHAPE_OUTLINE_STROKE,
+            );
         }
         "triangle" => {
             let points = regular_polygon_points(
@@ -430,7 +444,14 @@ fn draw_shape_outline(
             draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
         }
         _ => {
-            draw_circle_outline(canvas, center_x, center_y, radius, outline, SHAPE_OUTLINE_STROKE);
+            draw_circle_outline(
+                canvas,
+                center_x,
+                center_y,
+                radius,
+                outline,
+                SHAPE_OUTLINE_STROKE,
+            );
         }
     }
 }
@@ -677,8 +698,8 @@ mod tests {
         let frame_positions = [(-0.25_f64, 0.25_f64)];
         let styles = [(Rgb([220, 20, 60]), "circle".to_string())];
 
-        let frame =
-            render_frame_png(&frame_positions, &styles, 64, false).expect("video frame should render");
+        let frame = render_frame_png(&frame_positions, &styles, 64, false)
+            .expect("video frame should render");
         let image = image::load_from_memory(&frame)
             .expect("generated frame should decode")
             .to_rgb8();
@@ -694,7 +715,9 @@ mod tests {
 
         let radius = marker_radius_for_shape(marker_radius(64), "circle");
         assert_eq!(
-            image.get_pixel((center.0 + radius) as u32, center.1 as u32).0,
+            image
+                .get_pixel((center.0 + radius) as u32, center.1 as u32)
+                .0,
             [0, 0, 0]
         );
     }

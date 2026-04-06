@@ -5,10 +5,10 @@ use axum::{
     Router,
     extract::{Form, Json, Path, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use rand::random;
+use rand::Rng;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use crate::{HumanEvalServerConfig, db, flow, flow::Difficulty, mcp::HumanEvalMcpServer, stimulus};
 
-const MAX_SAFE_MCP_SEED: u64 = (1u64 << 53) - 1;
+const WEB_SESSION_SEED_MIN: u64 = 1u64 << 16;
+const WEB_SESSION_SEED_MAX: u64 = (1u64 << 32) - 1;
 
 #[derive(Clone)]
 struct AppState {
@@ -38,8 +39,8 @@ struct RuntimeSession {
     difficulty: Difficulty,
     is_human: bool,
     show_answer_validation: bool,
-    identifier: Option<String>,
     modality_targets: flow::ModalityTargets,
+    modality_order: flow::ModalityOrder,
     current_item_index: usize,
     cached_task: Option<CachedTaskArtifacts>,
     awaiting_proceed: bool,
@@ -108,6 +109,7 @@ pub async fn run_server(config: HumanEvalServerConfig) -> Result<()> {
     let mut router = Router::new()
         .route("/", index_handler)
         .route("/start", post(start_route))
+        .route("/start/:session_uuid", get(resume_route))
         .route("/events", post(submit_route))
         .route("/proceed", post(proceed_route))
         .route("/ratings", post(ratings_route))
@@ -144,43 +146,53 @@ async fn index_route() -> Html<String> {
     Html(crate::views::render_setup_page().into_string())
 }
 
-async fn start_route(
-    State(state): State<AppState>,
-    Form(payload): Form<SetupPayload>,
-) -> Html<String> {
+async fn start_route(State(state): State<AppState>, Form(payload): Form<SetupPayload>) -> Response {
     let setup = match prepare_setup(&payload) {
         Ok(value) => value,
         Err(error) => {
-            return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            return Html(crate::views::render_error_page(&error.to_string()).into_string())
+                .into_response();
         }
     };
 
+    let session_uuid = {
+        let sessions = state.sessions.lock().await;
+        generate_session_uuid(&sessions)
+    };
+
     let modality_targets = flow::modality_targets_from_seed(setup.session_seed);
-    let first_item =
-        match flow::build_plan_item(setup.session_seed, setup.difficulty, &modality_targets, 0) {
-            Ok(item) => item,
-            Err(error) => {
-                return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
-            }
-        };
-    let first_stimulus = match stimulus::build_task_stimulus(
-        setup.session_seed,
+    let modality_order = flow::modality_order_from_seed(setup.session_seed);
+    let session_seed_i64 = match i64::try_from(setup.session_seed) {
+        Ok(value) => value,
+        Err(_) => {
+            return Html(
+                crate::views::render_error_page("session seed generation overflow").into_string(),
+            )
+            .into_response();
+        }
+    };
+    let created = match db::create_session(
+        &state.pool,
+        &session_uuid.to_string(),
+        session_seed_i64,
         setup.difficulty,
-        &first_item,
         setup.is_human,
-    ) {
-        Ok(stimulus) => stimulus,
+        setup.show_answer_validation,
+        setup.identifier.as_deref(),
+        0,
+        &modality_targets,
+        &modality_order,
+    )
+    .await
+    {
+        Ok(created) => created,
         Err(error) => {
-            return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            return Html(crate::views::render_error_page(&error.to_string()).into_string())
+                .into_response();
         }
     };
 
     let mut sessions = state.sessions.lock().await;
-    let session_uuid = generate_session_uuid(&sessions);
-    let cached_task = CachedTaskArtifacts {
-        plan_item: first_item.clone(),
-        stimulus: first_stimulus.clone(),
-    };
     sessions.insert(
         session_uuid,
         RuntimeSession {
@@ -188,39 +200,182 @@ async fn start_route(
             difficulty: setup.difficulty,
             is_human: setup.is_human,
             show_answer_validation: setup.show_answer_validation,
-            identifier: setup.identifier,
             modality_targets,
-            current_item_index: 0,
-            cached_task: Some(cached_task),
+            modality_order,
+            current_item_index: match usize::try_from(created.next_question_index) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Html(
+                        crate::views::render_error_page("session progress index is invalid")
+                            .into_string(),
+                    )
+                    .into_response();
+                }
+            },
+            cached_task: None,
             awaiting_proceed: false,
-            db_session_id: None,
+            db_session_id: Some(created.session_id),
             completed: false,
         },
     );
     drop(sessions);
 
-    let ai_native_info = if setup.is_human {
+    Redirect::to(&format!("/start/{session_uuid}")).into_response()
+}
+
+async fn resume_route(
+    State(state): State<AppState>,
+    Path(session_uuid): Path<Uuid>,
+) -> Html<String> {
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(runtime) = sessions.get_mut(&session_uuid) {
+            if runtime.completed {
+                return Html(crate::views::render_error_page("session not found").into_string());
+            }
+            return Html(
+                render_session_page(&session_uuid, runtime).unwrap_or_else(|error| {
+                    crate::views::render_error_page(&error.to_string()).into_string()
+                }),
+            );
+        }
+    }
+
+    let Some(record) = (match db::get_session(&state.pool, &session_uuid.to_string()).await {
+        Ok(record) => record,
+        Err(error) => {
+            return Html(crate::views::render_error_page(&error.to_string()).into_string());
+        }
+    }) else {
+        return Html(crate::views::render_error_page("session not found").into_string());
+    };
+
+    if record.completed {
+        return Html(crate::views::render_error_page("session not found").into_string());
+    }
+
+    let difficulty = match db::parse_difficulty(&record.difficulty) {
+        Ok(value) => value,
+        Err(error) => {
+            return Html(crate::views::render_error_page(&error.to_string()).into_string());
+        }
+    };
+    let modality_targets = match parse_modality_targets_from_record(&record) {
+        Ok(value) => value,
+        Err(error) => {
+            return Html(crate::views::render_error_page(&error.to_string()).into_string());
+        }
+    };
+    let modality_order = match parse_modality_order_from_record(&record) {
+        Ok(value) => value,
+        Err(error) => {
+            return Html(crate::views::render_error_page(&error.to_string()).into_string());
+        }
+    };
+    let current_item_index = match usize::try_from(record.next_question_index) {
+        Ok(value) => value,
+        Err(_) => {
+            return Html(
+                crate::views::render_error_page("session progress index is invalid").into_string(),
+            );
+        }
+    };
+    if current_item_index > flow::total_items() {
+        return Html(
+            crate::views::render_error_page("session progress index is out of bounds")
+                .into_string(),
+        );
+    }
+
+    let mut runtime = RuntimeSession {
+        seed: match u64::try_from(record.seed) {
+            Ok(value) => value,
+            Err(_) => {
+                return Html(
+                    crate::views::render_error_page("session seed is invalid").into_string(),
+                );
+            }
+        },
+        difficulty,
+        is_human: record.is_human,
+        show_answer_validation: record.show_answer_validation,
+        modality_targets,
+        modality_order,
+        current_item_index,
+        cached_task: None,
+        awaiting_proceed: false,
+        db_session_id: Some(record.session_id.clone()),
+        completed: false,
+    };
+
+    let rendered = match render_session_page(&session_uuid, &mut runtime) {
+        Ok(html) => html,
+        Err(error) => {
+            return Html(crate::views::render_error_page(&error.to_string()).into_string());
+        }
+    };
+
+    let mut sessions = state.sessions.lock().await;
+    sessions.insert(session_uuid, runtime);
+    drop(sessions);
+
+    Html(rendered)
+}
+
+fn parse_modality_targets_from_record(record: &db::SessionRecord) -> Result<flow::ModalityTargets> {
+    let parse_target = |raw: &str, column: &str| {
+        flow::QuestionTarget::from_str(raw).ok_or_else(|| {
+            anyhow!("invalid {column} value '{raw}', expected one of oqp|xct|zqh|lme")
+        })
+    };
+
+    Ok([
+        parse_target(&record.image_target, "image_target")?,
+        parse_target(&record.video_target, "video_target")?,
+        parse_target(&record.text_target, "text_target")?,
+        parse_target(&record.tabular_target, "tabular_target")?,
+        parse_target(&record.sound_target, "sound_target")?,
+    ])
+}
+
+fn parse_modality_order_from_record(record: &db::SessionRecord) -> Result<flow::ModalityOrder> {
+    flow::parse_modality_order(&record.modality_order).map_err(|error| {
+        anyhow!(
+            "invalid modality_order value '{}': {error}",
+            record.modality_order
+        )
+    })
+}
+
+fn render_session_page(session_uuid: &Uuid, runtime: &mut RuntimeSession) -> Result<String> {
+    if runtime.current_item_index >= flow::total_items() {
+        return Ok(crate::views::render_ratings_page(&session_uuid.to_string()).into_string());
+    }
+
+    let CachedTaskArtifacts {
+        plan_item,
+        stimulus,
+    } = cache_or_rebuild_task_artifacts(runtime, runtime.current_item_index)?;
+    let ai_native_info = if runtime.is_human {
         None
     } else {
         Some(build_ai_native_info(
-            setup.session_seed,
-            setup.difficulty,
-            &first_item,
+            runtime.seed,
+            runtime.difficulty,
+            &plan_item,
         ))
     };
 
-    Html(
-        crate::views::render_task_page(
-            &session_uuid.to_string(),
-            &first_item,
-            &first_stimulus,
-            0,
-            None,
-            ai_native_info.as_ref(),
-            setup.show_answer_validation,
-        )
-        .into_string(),
+    Ok(crate::views::render_task_page(
+        &session_uuid.to_string(),
+        &plan_item,
+        &stimulus,
+        runtime.current_item_index,
+        None,
+        ai_native_info.as_ref(),
+        runtime.show_answer_validation,
     )
+    .into_string())
 }
 
 async fn submit_route(
@@ -285,7 +440,7 @@ async fn submit_route(
         }
     };
 
-    if runtime.db_session_id.is_some() || !expected_plan.is_practice {
+    if let Some(session_id) = runtime.db_session_id.clone() {
         let payload_index_i32 = match i32::try_from(payload.question_index) {
             Ok(value) => value,
             Err(_) => {
@@ -314,79 +469,58 @@ async fn submit_route(
             }
         };
 
-        let session_id = match runtime.db_session_id.clone() {
-            Some(value) => value,
-            None => {
-                let session_seed_i64 = match i64::try_from(runtime.seed) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return Html(
-                            crate::views::render_error_fragment("session seed generation overflow")
-                                .into_string(),
-                        );
-                    }
-                };
-
-                let created = match db::create_session(
-                    &state.pool,
-                    &payload.session_uuid.to_string(),
-                    session_seed_i64,
-                    runtime.difficulty,
-                    runtime.is_human,
-                    runtime.show_answer_validation,
-                    runtime.identifier.as_deref(),
-                    expected_index_i32,
-                    &runtime.modality_targets,
-                )
-                .await
-                {
-                    Ok(created) => created,
-                    Err(error) => {
-                        return Html(
-                            crate::views::render_error_fragment(&error.to_string()).into_string(),
-                        );
-                    }
-                };
-
-                runtime.db_session_id = Some(created.session_id.clone());
-                created.session_id
+        let db_session = match db::get_session(&state.pool, &session_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return Html(
+                    crate::views::render_error_fragment("session not found").into_string(),
+                );
             }
-        };
-
-        if let Some(db_session) = match db::get_session(&state.pool, &session_id).await {
-            Ok(Some(value)) => Some(value),
-            Ok(None) => None,
             Err(error) => {
                 return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
             }
-        } {
-            if db_session.current_item_index != payload_index_i32 {
-                return Html(
-                    crate::views::render_error_fragment(
-                        "question index does not match server-side progress",
-                    )
-                    .into_string(),
-                );
-            }
-        } else {
-            return Html(crate::views::render_error_fragment("session not found").into_string());
+        };
+        if db_session.completed {
+            runtime.completed = true;
+            return Html(crate::views::render_completion_fragment().into_string());
+        }
+        if db_session.next_question_index != payload_index_i32 {
+            return Html(
+                crate::views::render_error_fragment(
+                    "question index does not match server-side progress",
+                )
+                .into_string(),
+            );
         }
 
-        if let Err(error) = db::record_answer(
+        let updated = match db::record_answer(
             &state.pool,
             &session_id,
-            payload_index_i32,
+            expected_index_i32,
             next_index_i32,
             expected_plan.modality.as_str(),
             is_correct,
         )
         .await
         {
-            return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
-        }
-    }
+            Ok(updated) => updated,
+            Err(error) => {
+                return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            }
+        };
 
-    runtime.current_item_index = next_index;
+        runtime.current_item_index = match usize::try_from(updated.next_question_index) {
+            Ok(value) => value,
+            Err(_) => {
+                return Html(
+                    crate::views::render_error_fragment("task index exceeded runtime limits")
+                        .into_string(),
+                );
+            }
+        };
+    } else {
+        runtime.current_item_index = next_index;
+    }
     runtime.awaiting_proceed = true;
 
     let ai_native_info = if runtime.is_human {
@@ -516,10 +650,8 @@ async fn ratings_route(
     }
 
     let Some(session_id) = runtime.db_session_id.clone() else {
-        return Html(
-            crate::views::render_error_fragment("no scored answers were recorded for this session")
-                .into_string(),
-        );
+        runtime.completed = true;
+        return Html(crate::views::render_completion_fragment().into_string());
     };
 
     match db::store_ratings(
@@ -635,14 +767,12 @@ async fn debug_preview_route(
         }
     };
     let is_human = role != "ai";
-    let seed: u64 = 42;
+    let seed = random_web_session_seed();
 
-    // Compute item_index for the first non-practice scene of this modality.
     let modality_index = flow::modality_order_index(modality);
     let item_index =
         modality_index * flow::SCENES_PER_MODALITY_TOTAL + flow::PRACTICE_SCENES_PER_MODALITY;
 
-    // Override the target for this modality to the one requested.
     let mut modality_targets = flow::modality_targets_from_seed(seed);
     modality_targets[modality_index] = target;
     let item = match flow::build_plan_item(seed, difficulty, &modality_targets, item_index) {
@@ -667,8 +797,8 @@ async fn debug_preview_route(
             difficulty,
             is_human,
             show_answer_validation: true,
-            identifier: None,
             modality_targets,
+            modality_order: flow::canonical_modality_order(),
             current_item_index: item_index,
             cached_task: Some(cached_task),
             awaiting_proceed: false,
@@ -787,7 +917,7 @@ fn compare_answer(
 
 fn prepare_setup(payload: &SetupPayload) -> Result<SetupPayloadState> {
     let difficulty = Difficulty::from_str(&payload.difficulty)?;
-    let session_seed = random::<u64>() & MAX_SAFE_MCP_SEED;
+    let session_seed = random_web_session_seed();
 
     let identifier = payload
         .identifier
@@ -803,6 +933,10 @@ fn prepare_setup(payload: &SetupPayload) -> Result<SetupPayloadState> {
         identifier,
         session_seed,
     })
+}
+
+fn random_web_session_seed() -> u64 {
+    rand::thread_rng().gen_range(WEB_SESSION_SEED_MIN..=WEB_SESSION_SEED_MAX)
 }
 
 fn generate_session_uuid(sessions: &HashMap<Uuid, RuntimeSession>) -> Uuid {
@@ -824,10 +958,11 @@ fn cache_or_rebuild_task_artifacts(
         return Ok(cached.clone());
     }
 
-    let plan_item = flow::build_plan_item(
+    let plan_item = flow::build_plan_item_with_modality_order(
         runtime.seed,
         runtime.difficulty,
         &runtime.modality_targets,
+        &runtime.modality_order,
         item_index,
     )
     .map_err(|error| {
@@ -905,7 +1040,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepare_setup_generates_js_safe_seed() {
+    fn prepare_setup_generates_reserved_web_seed_range() {
         for _ in 0..1024 {
             let payload = SetupPayload {
                 is_human: false,
@@ -914,7 +1049,7 @@ mod tests {
                 identifier: None,
             };
             let setup = prepare_setup(&payload).expect("setup should be valid");
-            assert!(setup.session_seed <= MAX_SAFE_MCP_SEED);
+            assert!((WEB_SESSION_SEED_MIN..=WEB_SESSION_SEED_MAX).contains(&setup.session_seed));
         }
     }
 
@@ -938,7 +1073,6 @@ mod tests {
             difficulty: Difficulty::Easy,
             is_human: true,
             show_answer_validation: false,
-            identifier: None,
             modality_targets: [
                 flow::QuestionTarget::OrderedQuadrantPassage,
                 flow::QuestionTarget::CrossingCount,
@@ -946,6 +1080,7 @@ mod tests {
                 flow::QuestionTarget::LargestMotionShape,
                 flow::QuestionTarget::OrderedQuadrantPassage,
             ],
+            modality_order: flow::canonical_modality_order(),
             current_item_index: 0,
             cached_task: None,
             awaiting_proceed: false,
@@ -985,5 +1120,60 @@ mod tests {
                 .item_index,
             3
         );
+    }
+
+    #[test]
+    fn parse_modality_targets_from_record_decodes_all_target_columns() {
+        let record = db::SessionRecord {
+            session_id: "s".to_string(),
+            seed: 42,
+            difficulty: "easy".to_string(),
+            is_human: true,
+            show_answer_validation: false,
+            current_item_index: 0,
+            next_question_index: 0,
+            image_target: "oqp".to_string(),
+            video_target: "xct".to_string(),
+            text_target: "zqh".to_string(),
+            tabular_target: "lme".to_string(),
+            sound_target: "oqp".to_string(),
+            modality_order: "0,1,2,3,4".to_string(),
+            completed: false,
+        };
+
+        let targets =
+            parse_modality_targets_from_record(&record).expect("targets should parse cleanly");
+        assert_eq!(targets[0], flow::QuestionTarget::OrderedQuadrantPassage);
+        assert_eq!(targets[1], flow::QuestionTarget::CrossingCount);
+        assert_eq!(targets[2], flow::QuestionTarget::QuadrantAfterMoves);
+        assert_eq!(targets[3], flow::QuestionTarget::LargestMotionShape);
+        assert_eq!(targets[4], flow::QuestionTarget::OrderedQuadrantPassage);
+    }
+
+    #[test]
+    fn render_session_page_shows_ratings_when_questions_are_complete() {
+        let mut runtime = RuntimeSession {
+            seed: 1337,
+            difficulty: Difficulty::Easy,
+            is_human: true,
+            show_answer_validation: false,
+            modality_targets: [
+                flow::QuestionTarget::OrderedQuadrantPassage,
+                flow::QuestionTarget::CrossingCount,
+                flow::QuestionTarget::QuadrantAfterMoves,
+                flow::QuestionTarget::LargestMotionShape,
+                flow::QuestionTarget::OrderedQuadrantPassage,
+            ],
+            modality_order: flow::canonical_modality_order(),
+            current_item_index: flow::total_items(),
+            cached_task: None,
+            awaiting_proceed: false,
+            db_session_id: Some("abc".to_string()),
+            completed: false,
+        };
+
+        let html = render_session_page(&Uuid::now_v7(), &mut runtime)
+            .expect("rendering ratings state should succeed");
+        assert!(html.contains("Submit Ratings"));
     }
 }

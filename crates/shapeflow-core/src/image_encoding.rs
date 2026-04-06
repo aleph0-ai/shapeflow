@@ -517,13 +517,7 @@ fn render_time_slot_frame_motion_and_axes(
 
     for (shape_index, center_x, center_y, radius) in &markers {
         let (_, shape_type) = &shape_styles[*shape_index];
-        draw_shape_outline(
-            canvas,
-            *center_x,
-            *center_y,
-            *radius,
-            shape_type.as_str(),
-        );
+        draw_shape_outline(canvas, *center_x, *center_y, *radius, shape_type.as_str());
     }
 
     let axis_box_size = thumbnail_size_i32;
@@ -836,7 +830,14 @@ fn draw_shape_outline(
     let outline = Rgb([0, 0, 0]);
     match shape_type {
         "circle" => {
-            draw_circle_outline(canvas, center_x, center_y, radius, outline, SHAPE_OUTLINE_STROKE);
+            draw_circle_outline(
+                canvas,
+                center_x,
+                center_y,
+                radius,
+                outline,
+                SHAPE_OUTLINE_STROKE,
+            );
         }
         "triangle" => {
             let points = regular_polygon_points(
@@ -879,7 +880,14 @@ fn draw_shape_outline(
             draw_polygon_outline(canvas, &points, outline, SHAPE_OUTLINE_STROKE);
         }
         _ => {
-            draw_circle_outline(canvas, center_x, center_y, radius, outline, SHAPE_OUTLINE_STROKE);
+            draw_circle_outline(
+                canvas,
+                center_x,
+                center_y,
+                radius,
+                outline,
+                SHAPE_OUTLINE_STROKE,
+            );
         }
     }
 }

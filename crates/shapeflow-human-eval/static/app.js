@@ -94,7 +94,6 @@ function wireVideoPlayers(root) {
 var _defaultVolume = 0.25;
 
 function wireAudioPreviewButtons(root) {
-    // Set default volume on all <audio> elements
     root.querySelectorAll("audio[controls]").forEach(function (el) {
         if (el.dataset.volSet !== "1") {
             el.dataset.volSet = "1";

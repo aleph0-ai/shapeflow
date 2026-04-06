@@ -459,7 +459,7 @@ impl PyShapeFlowConfig {
     ///
     /// Uses core baseline defaults and then applies policy overrides.
     /// Prefer `from_policy(...)` for explicit construction.
-    #[pyo3(signature = (preset, master_seed=1234))]
+    #[pyo3(signature = (preset, master_seed=42))]
     fn from_policy_with_defaults(
         preset: ShapeFlowConfigPreset,
         master_seed: u64,
@@ -628,6 +628,10 @@ impl PyShapeFlowConfig {
             })
         })?;
         Ok(())
+    }
+
+    fn config_identity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        config_identity_to_py(py, &self.config)
     }
 
     fn dataset_identity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -1173,6 +1177,10 @@ impl ShapeFlowBridge {
         }
     }
 
+    fn config_identity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        config_identity_to_py(py, &self.config)
+    }
+
     fn dataset_identity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         dataset_identity_to_py(py, &self.config)
     }
@@ -1355,6 +1363,16 @@ struct MaterializationSummary {
 }
 
 #[pyfunction(signature = (config_path))]
+/// Return config identity for config at `config_path`.
+///
+/// Args:
+///     config_path: Filesystem path to config TOML.
+fn config_identity(py: Python<'_>, config_path: &str) -> PyResult<Py<PyAny>> {
+    let config = load_and_validate_config(config_path).map_err(to_py_err)?;
+    config_identity_to_py(py, &config)
+}
+
+#[pyfunction(signature = (config_path))]
 /// Return dataset identity for config at `config_path`.
 ///
 /// Args:
@@ -1507,6 +1525,7 @@ fn shapeflow(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyShapeFlowConfig>()?;
     module.add_class::<ShapeFlowBridge>()?;
     module.add_class::<SceneBatchIterator>()?;
+    module.add_function(wrap_pyfunction!(config_identity, module)?)?;
     module.add_function(wrap_pyfunction!(dataset_identity, module)?)?;
     module.add_function(wrap_pyfunction!(generate_scene, module)?)?;
     module.add_function(wrap_pyfunction!(generate_batch, module)?)?;
@@ -1904,6 +1923,23 @@ fn materialize_dataset_from_config(
     })
 }
 
+fn config_identity_to_py(py: Python<'_>, config: &ShapeFlowConfig) -> PyResult<Py<PyAny>> {
+    let identity = config
+        .config_identity()
+        .map_err(BridgeError::ConfigValidation)
+        .map_err(to_py_err)?;
+    let identity_dict = PyDict::new(py);
+    identity_dict.set_item("config_hash", identity.config_hash_hex)?;
+    if let Some(profile) = identity.generation_profile {
+        identity_dict.set_item("generation_profile", profile.name)?;
+        identity_dict.set_item("generation_profile_version", profile.version)?;
+    } else {
+        identity_dict.set_item("generation_profile", py.None())?;
+        identity_dict.set_item("generation_profile_version", py.None())?;
+    }
+    Ok(identity_dict.into_any().unbind())
+}
+
 fn dataset_identity_to_py(py: Python<'_>, config: &ShapeFlowConfig) -> PyResult<Py<PyAny>> {
     let identity = config
         .dataset_identity()
@@ -1911,6 +1947,8 @@ fn dataset_identity_to_py(py: Python<'_>, config: &ShapeFlowConfig) -> PyResult<
         .map_err(to_py_err)?;
     let identity_dict = PyDict::new(py);
     identity_dict.set_item("master_seed", identity.master_seed)?;
+    identity_dict.set_item("dataset_version_major", identity.dataset_version_major)?;
+    identity_dict.set_item("dataset_version_minor", identity.dataset_version_minor)?;
     identity_dict.set_item("config_hash", identity.config_hash_hex)?;
     if let Some(profile) = identity.generation_profile {
         identity_dict.set_item("generation_profile", profile.name)?;
@@ -2084,6 +2122,37 @@ mod tests {
         .expect("with_defaults should succeed for baseline-compatible values")
     }
 
+    #[test]
+    fn python_api_rejects_master_seed_in_reserved_range() {
+        let err = PyShapeFlowConfig::with_defaults(
+            1u64 << 16,
+            512,
+            2,
+            2,
+            24,
+            "ease_in_out",
+            6,
+            vec![3, 3],
+            Some(6),
+            true,
+            44_100,
+            24,
+            250,
+            "stereo_alternating",
+            "sigmoid",
+            "tanh",
+            3.0,
+            2.0,
+            10,
+            0.05,
+            32,
+            64,
+            4,
+        )
+        .expect_err("master_seed >= 2^16 should fail validation");
+        assert!(err.to_string().contains("Please use seeds below 2^16"));
+    }
+
     fn py_repr(py: Python<'_>, value: &Py<PyAny>) -> String {
         value
             .bind(py)
@@ -2113,6 +2182,16 @@ mod tests {
             .ok_or_else(|| PyValueError::new_err("dataset identity should include config_hash"))?
             .extract::<String>()?;
         Ok((master_seed, config_hash))
+    }
+
+    fn config_identity_hash(py: Python<'_>, config: &PyShapeFlowConfig) -> PyResult<String> {
+        let identity = config.config_identity(py)?;
+        let identity = identity.bind(py);
+        let identity_dict = identity.cast::<PyDict>()?;
+        identity_dict
+            .get_item("config_hash")?
+            .ok_or_else(|| PyValueError::new_err("config identity should include config_hash"))?
+            .extract::<String>()
     }
 
     fn expected_scene_batch(
@@ -2165,6 +2244,18 @@ mod tests {
                 dataset_identity(py, &config_path).expect("public dataset_identity should succeed");
             let expected = dataset_identity_to_py(py, &bootstrap_config())
                 .expect("core dataset_identity conversion should succeed");
+            assert_eq!(py_repr(py, &public), py_repr(py, &expected));
+        });
+    }
+
+    #[test]
+    fn public_config_identity_matches_core_identity() {
+        let config_path = bootstrap_config_path();
+        Python::attach(|py| {
+            let public =
+                config_identity(py, &config_path).expect("public config_identity should succeed");
+            let expected = config_identity_to_py(py, &bootstrap_config())
+                .expect("core config_identity conversion should succeed");
             assert_eq!(py_repr(py, &public), py_repr(py, &expected));
         });
     }
@@ -2364,6 +2455,13 @@ mod tests {
                 .expect("bridge dataset_identity should succeed");
             assert_eq!(py_repr(py, &free_dataset), py_repr(py, &bridge_dataset));
 
+            let free_config =
+                config_identity(py, &config_path).expect("public config_identity should succeed");
+            let bridge_config = bridge
+                .config_identity(py)
+                .expect("bridge config_identity should succeed");
+            assert_eq!(py_repr(py, &free_config), py_repr(py, &bridge_config));
+
             let free_scene = generate_scene(py, &config_path, 4, 24, "soft_quadrants")
                 .expect("public generate_scene should succeed");
             let bridge_scene = bridge
@@ -2551,6 +2649,51 @@ mod tests {
                 .expect("dataset_identity for config_b should succeed");
             assert_ne!(seed_a, seed_b);
             assert_eq!(hash_a, hash_b);
+        });
+    }
+
+    #[test]
+    fn config_config_identity_excludes_master_seed_from_hash_via_python_api() {
+        let config_a = config_with_defaults(777);
+        let config_b = config_with_defaults(778);
+        Python::attach(|py| {
+            let hash_a = config_identity_hash(py, &config_a)
+                .expect("config_identity for config_a should succeed");
+            let hash_b = config_identity_hash(py, &config_b)
+                .expect("config_identity for config_b should succeed");
+            assert_eq!(hash_a, hash_b);
+        });
+    }
+
+    #[test]
+    fn dataset_identity_includes_dataset_version_fields() {
+        let config = config_with_defaults(777);
+        Python::attach(|py| {
+            let identity = config
+                .dataset_identity(py)
+                .expect("dataset_identity should succeed");
+            let identity = identity.bind(py);
+            let identity_dict = identity.cast::<PyDict>().expect("identity should be dict");
+            let major = identity_dict
+                .get_item("dataset_version_major")
+                .expect("dict access should succeed")
+                .expect("dataset identity should include dataset_version_major")
+                .extract::<u64>()
+                .expect("dataset_version_major should be integer");
+            let minor = identity_dict
+                .get_item("dataset_version_minor")
+                .expect("dict access should succeed")
+                .expect("dataset identity should include dataset_version_minor")
+                .extract::<u64>()
+                .expect("dataset_version_minor should be integer");
+            let expected_major = env!("CARGO_PKG_VERSION_MAJOR")
+                .parse::<u64>()
+                .expect("CARGO_PKG_VERSION_MAJOR should parse");
+            let expected_minor = env!("CARGO_PKG_VERSION_MINOR")
+                .parse::<u64>()
+                .expect("CARGO_PKG_VERSION_MINOR should parse");
+            assert_eq!(major, expected_major);
+            assert_eq!(minor, expected_minor);
         });
     }
 

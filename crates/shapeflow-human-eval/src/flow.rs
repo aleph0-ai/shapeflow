@@ -4,8 +4,8 @@ use std::fmt::{Display, Formatter};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use shapeflow_core::config::MotionEventsPerShapeRange;
 use shapeflow_core::{
-    ShapeFlowConfig, canonical_class_rank_for_scene_seed, generate_scene,
-    generate_scene_targets_for_index,
+    MAX_MASTER_SEED_EXCLUSIVE, ShapeFlowConfig, TextAlterationProfile, TextReferenceFrame,
+    canonical_class_rank_for_scene_seed, generate_scene, generate_scene_targets_for_index,
     scene_generation::{SceneGenerationOutput, SceneGenerationParams, SceneProjectionMode},
     tabular_encoding::{COLOR_PALETTE, SHAPE_TYPE_PALETTE, shape_identity_for_scene_seed},
 };
@@ -14,12 +14,14 @@ pub const PRACTICE_SCENES_PER_MODALITY: usize = 2;
 pub const REAL_SCENES_PER_MODALITY: usize = 5;
 pub const SCENES_PER_MODALITY_TOTAL: usize =
     PRACTICE_SCENES_PER_MODALITY + REAL_SCENES_PER_MODALITY;
+pub const MODALITY_COUNT: usize = 5;
 const SCENES_PER_MODALITY: usize = SCENES_PER_MODALITY_TOTAL;
 const SAMPLES_PER_EVENT: usize = 24;
 const MODALITY_TARGET_SEED_MIX: u64 = 0xA71F_C0DE_5EED_0145;
+const MODALITY_ORDER_SHUFFLE_SEED_MIX: u64 = 0x4D4F_4441_4C49_5459;
 const LARGEST_EVENT_DISTANCE_TIE_TOLERANCE: f64 = 1.0e-12;
 
-const MODALITY_ORDER: [Modality; 5] = [
+const MODALITY_ORDER: [Modality; MODALITY_COUNT] = [
     Modality::Image,
     Modality::Video,
     Modality::Text,
@@ -34,7 +36,8 @@ const QUESTION_TARGETS: [QuestionTarget; 4] = [
     QuestionTarget::LargestMotionShape,
 ];
 
-pub type ModalityTargets = [QuestionTarget; 5];
+pub type ModalityTargets = [QuestionTarget; MODALITY_COUNT];
+pub type ModalityOrder = [usize; MODALITY_COUNT];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Difficulty {
@@ -126,6 +129,7 @@ pub enum FlowError {
     InvalidDifficulty(String),
     InvalidSceneIndex(String),
     InvalidModalityIndex(usize),
+    InvalidModalityOrder(String),
     InvalidFormAnswer(String),
     CoreConfig(String),
     CoreGeneration(String),
@@ -143,6 +147,7 @@ impl Display for FlowError {
             }
             Self::InvalidSceneIndex(value) => write!(f, "invalid scene index {value}"),
             Self::InvalidModalityIndex(index) => write!(f, "invalid modality index {index}"),
+            Self::InvalidModalityOrder(value) => write!(f, "invalid modality order: {value}"),
             Self::InvalidFormAnswer(value) => {
                 write!(f, "could not parse answer '{value}'")
             }
@@ -257,6 +262,66 @@ pub fn modality_order_index(modality: Modality) -> usize {
         .unwrap_or(0)
 }
 
+pub fn modality_from_canonical_index(index: usize) -> Result<Modality, FlowError> {
+    MODALITY_ORDER
+        .get(index)
+        .copied()
+        .ok_or(FlowError::InvalidModalityIndex(index))
+}
+
+pub fn canonical_modality_order() -> ModalityOrder {
+    [0, 1, 2, 3, 4]
+}
+
+pub fn modality_order_from_seed(seed: u64) -> ModalityOrder {
+    let mut order = canonical_modality_order();
+    let mut rng = StdRng::seed_from_u64(seed ^ MODALITY_ORDER_SHUFFLE_SEED_MIX);
+    for index in (1..order.len()).rev() {
+        let pick = rng.gen_range(0..=index);
+        order.swap(index, pick);
+    }
+    order
+}
+
+pub fn serialize_modality_order(order: &ModalityOrder) -> String {
+    order
+        .iter()
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn parse_modality_order(raw: &str) -> Result<ModalityOrder, FlowError> {
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            token
+                .parse::<usize>()
+                .map_err(|_| FlowError::InvalidModalityOrder(raw.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if values.len() != MODALITY_ORDER.len() {
+        return Err(FlowError::InvalidModalityOrder(raw.to_string()));
+    }
+
+    let mut seen = [false; MODALITY_COUNT];
+    for &value in &values {
+        if value >= MODALITY_ORDER.len() || seen[value] {
+            return Err(FlowError::InvalidModalityOrder(raw.to_string()));
+        }
+        seen[value] = true;
+    }
+
+    let mut order = [0usize; MODALITY_COUNT];
+    for (index, value) in values.into_iter().enumerate() {
+        order[index] = value;
+    }
+    Ok(order)
+}
+
 pub fn total_items() -> usize {
     MODALITY_ORDER.len() * SCENES_PER_MODALITY
 }
@@ -287,23 +352,27 @@ pub fn build_session_config(
     seed: u64,
     difficulty: Difficulty,
 ) -> Result<ShapeFlowConfig, FlowError> {
-    let (slots, shapes) = match difficulty {
-        Difficulty::Easy => (4u32, 3u8),
-        Difficulty::Medium => (8u32, 4u8),
-        Difficulty::Hard => (12u32, 5u8),
+    let (slots, shapes, text_reference_frame, text_synonym_rate, text_typo_rate) = match difficulty
+    {
+        Difficulty::Easy => (4u32, 3u8, TextReferenceFrame::Canonical, 0.0, 0.0),
+        Difficulty::Medium => (8u32, 4u8, TextReferenceFrame::Mixed, 0.20, 0.03),
+        Difficulty::Hard => (12u32, 5u8, TextReferenceFrame::Mixed, 0.45, 0.08),
     };
 
     let min_events = slots / 4;
     let max_events = slots;
     let total_cap = (slots.saturating_mul(3)) / 2;
 
-    let mut config = ShapeFlowConfig::baseline(seed);
+    let mut config = ShapeFlowConfig::baseline(seed % MAX_MASTER_SEED_EXCLUSIVE);
     config.scene.n_shapes = shapes;
     config.scene.n_motion_slots = slots;
     config.scene.allow_simultaneous = true;
     config.scene.randomize_motion_events_per_shape = true;
     config.scene.motion_events_per_shape = Vec::new();
     config.scene.n_motion_events_total = Some(total_cap);
+    config.scene.text_reference_frame = text_reference_frame;
+    config.scene.text_synonym_rate = text_synonym_rate;
+    config.scene.text_typo_rate = text_typo_rate;
 
     config.scene.motion_events_per_shape_random_ranges = Some(vec![
         MotionEventsPerShapeRange {
@@ -320,14 +389,45 @@ pub fn build_session_config(
     Ok(config)
 }
 
+pub fn text_alteration_profile_for_difficulty(difficulty: Difficulty) -> TextAlterationProfile {
+    match difficulty {
+        Difficulty::Easy => TextAlterationProfile::Canonical,
+        Difficulty::Medium => TextAlterationProfile::EventClauseReordered,
+        Difficulty::Hard => TextAlterationProfile::FullyReordered,
+    }
+}
+
 pub fn build_plan_item(
     seed: u64,
     difficulty: Difficulty,
     modality_targets: &ModalityTargets,
     item_index: usize,
 ) -> Result<PlanItem, FlowError> {
+    build_plan_item_with_modality_order(
+        seed,
+        difficulty,
+        modality_targets,
+        &canonical_modality_order(),
+        item_index,
+    )
+}
+
+pub fn build_plan_item_with_modality_order(
+    seed: u64,
+    difficulty: Difficulty,
+    modality_targets: &ModalityTargets,
+    modality_order: &ModalityOrder,
+    item_index: usize,
+) -> Result<PlanItem, FlowError> {
     let config = build_session_config(seed, difficulty)?;
-    build_plan_item_from_config(&config, modality_targets, item_index, SAMPLES_PER_EVENT)
+    build_plan_item_from_config(
+        &config,
+        seed,
+        modality_targets,
+        modality_order,
+        item_index,
+        SAMPLES_PER_EVENT,
+    )
 }
 
 pub fn build_scene_for_seed(
@@ -336,16 +436,32 @@ pub fn build_scene_for_seed(
     scene_index: u32,
 ) -> Result<SceneGenerationOutput, FlowError> {
     let config = build_session_config(seed, difficulty)?;
-    build_scene_for_index(&config, scene_index)
+    build_scene_for_seed_index(&config, seed, scene_index)
 }
 
 pub fn build_scene_for_index(
     config: &ShapeFlowConfig,
     scene_index: u32,
 ) -> Result<SceneGenerationOutput, FlowError> {
+    build_scene_for_absolute_index(config, u64::from(scene_index))
+}
+
+fn build_scene_for_seed_index(
+    config: &ShapeFlowConfig,
+    seed: u64,
+    scene_index: u32,
+) -> Result<SceneGenerationOutput, FlowError> {
+    let effective_index = effective_scene_index(seed, scene_index)?;
+    build_scene_for_absolute_index(config, effective_index)
+}
+
+fn build_scene_for_absolute_index(
+    config: &ShapeFlowConfig,
+    scene_index: u64,
+) -> Result<SceneGenerationOutput, FlowError> {
     let params = SceneGenerationParams {
         config,
-        scene_index: u64::from(scene_index),
+        scene_index,
         samples_per_event: SAMPLES_PER_EVENT,
         projection: SceneProjectionMode::SoftQuadrants,
     };
@@ -476,20 +592,23 @@ pub fn shape_id_to_natural_label(shape_id: &str) -> String {
 
 fn build_plan_item_from_config(
     config: &ShapeFlowConfig,
+    seed: u64,
     modality_targets: &ModalityTargets,
+    modality_order: &ModalityOrder,
     item_index: usize,
     samples_per_event: usize,
 ) -> Result<PlanItem, FlowError> {
-    let modality_index = item_index / SCENES_PER_MODALITY;
+    let modality_slot = item_index / SCENES_PER_MODALITY;
     let local_index = item_index % SCENES_PER_MODALITY;
-    if modality_index >= MODALITY_ORDER.len() {
-        return Err(FlowError::InvalidModalityIndex(modality_index));
+    if modality_slot >= MODALITY_ORDER.len() {
+        return Err(FlowError::InvalidModalityIndex(modality_slot));
     }
 
-    let modality = MODALITY_ORDER[modality_index];
-    let target = modality_targets[modality_index];
+    let canonical_modality_index = modality_order[modality_slot];
+    let modality = modality_from_canonical_index(canonical_modality_index)?;
+    let target = modality_targets[canonical_modality_index];
 
-    let global_scene_index = modality_index
+    let global_scene_index = modality_slot
         .saturating_mul(SCENES_PER_MODALITY)
         .saturating_add(local_index);
     let scene_index = u32::try_from(global_scene_index).map_err(|_| {
@@ -504,7 +623,15 @@ fn build_plan_item_from_config(
     }
 
     let query_shape_index = local_index % shape_count;
-    let scene_layout_seed = config.master_seed + u64::from(scene_index);
+    let effective_scene_index = effective_scene_index(seed, scene_index)?;
+    let scene_layout_seed = config
+        .master_seed
+        .checked_add(effective_scene_index)
+        .ok_or_else(|| {
+            FlowError::InvalidSceneIndex(format!(
+                "scene index overflow for seed={seed} scene_index={scene_index}"
+            ))
+        })?;
     let shape_identity_assignment = config.scene.shape_identity_assignment;
     let query_identity = shape_identity_for_scene_seed(
         scene_layout_seed,
@@ -518,7 +645,7 @@ fn build_plan_item_from_config(
         QuestionTarget::LargestMotionShape => None,
         _ => {
             let generated_targets =
-                generate_scene_targets_for_index(config, u64::from(scene_index), samples_per_event)
+                generate_scene_targets_for_index(config, effective_scene_index, samples_per_event)
                     .map_err(|error| FlowError::CoreGeneration(error.to_string()))?;
             Some(
                 generated_targets
@@ -598,7 +725,7 @@ fn build_plan_item_from_config(
             )
         }
         QuestionTarget::LargestMotionShape => {
-            let scene = build_scene_for_index(config, scene_index)?;
+            let scene = build_scene_for_absolute_index(config, effective_scene_index)?;
             let mut canonical_ranks = Vec::with_capacity(shape_count);
             for shape_index in 0..shape_count {
                 let rank = canonical_class_rank_for_scene_seed(
@@ -695,6 +822,22 @@ fn build_plan_item_from_config(
     })
 }
 
+fn effective_scene_index(seed: u64, scene_index: u32) -> Result<u64, FlowError> {
+    let block = seed / MAX_MASTER_SEED_EXCLUSIVE;
+    let base = block
+        .checked_mul(MAX_MASTER_SEED_EXCLUSIVE)
+        .ok_or_else(|| {
+            FlowError::InvalidSceneIndex(format!(
+                "scene seed block overflow for seed={seed} scene_index={scene_index}"
+            ))
+        })?;
+    base.checked_add(u64::from(scene_index)).ok_or_else(|| {
+        FlowError::InvalidSceneIndex(format!(
+            "effective scene index overflow for seed={seed} scene_index={scene_index}"
+        ))
+    })
+}
+
 fn scalar_target_value(
     target_by_id: &BTreeMap<String, Vec<Vec<f64>>>,
     task_id: &str,
@@ -779,16 +922,183 @@ mod tests {
             QuestionTarget::LargestMotionShape,
         ];
 
-        let lme_item = build_plan_item_from_config(&config, &modality_targets, 0, 0)
-            .expect("lme items should be independent of target-generation samples");
+        let canonical_order = canonical_modality_order();
+        let lme_item = build_plan_item_from_config(
+            &config,
+            1337,
+            &modality_targets,
+            &canonical_order,
+            0,
+            0,
+        )
+        .expect("lme items should be independent of target-generation samples");
         assert_eq!(lme_item.target, QuestionTarget::LargestMotionShape);
 
-        let target_item_error =
-            build_plan_item_from_config(&config, &modality_targets, SCENES_PER_MODALITY, 0)
-                .expect_err("target tasks should still require target generation samples");
+        let target_item_error = build_plan_item_from_config(
+            &config,
+            1337,
+            &modality_targets,
+            &canonical_order,
+            SCENES_PER_MODALITY,
+            0,
+        )
+        .expect_err("target tasks should still require target generation samples");
         assert!(
             matches!(target_item_error, FlowError::CoreGeneration(_)),
             "expected core-generation failure when samples_per_event is zero"
         );
+    }
+
+    #[test]
+    fn build_session_config_normalizes_master_seed_to_public_range() {
+        let seed = (1u64 << 16) + 1337;
+        let config = build_session_config(seed, Difficulty::Easy).expect("config should be valid");
+        assert_eq!(config.master_seed, 1337);
+    }
+
+    #[test]
+    fn build_scene_for_seed_uses_effective_scene_index_mapping() {
+        let seed = (1u64 << 17) + 42;
+        let scene_index = 9u32;
+        let config =
+            build_session_config(seed, Difficulty::Medium).expect("config should be valid");
+        let mapped_scene = build_scene_for_seed(seed, Difficulty::Medium, scene_index)
+            .expect("scene should build");
+        let expected_scene = build_scene_for_absolute_index(
+            &config,
+            effective_scene_index(seed, scene_index).expect("effective index should resolve"),
+        )
+        .expect("direct mapped scene should build");
+        assert_eq!(mapped_scene, expected_scene);
+    }
+
+    #[test]
+    fn difficulty_levels_apply_text_noise_ladder() {
+        let easy = build_session_config(7, Difficulty::Easy).expect("easy config should build");
+        let medium =
+            build_session_config(7, Difficulty::Medium).expect("medium config should build");
+        let hard = build_session_config(7, Difficulty::Hard).expect("hard config should build");
+
+        assert_eq!(
+            easy.scene.text_reference_frame,
+            TextReferenceFrame::Canonical
+        );
+        assert_eq!(easy.scene.text_synonym_rate, 0.0);
+        assert_eq!(easy.scene.text_typo_rate, 0.0);
+
+        assert_eq!(medium.scene.text_reference_frame, TextReferenceFrame::Mixed);
+        assert!(medium.scene.text_synonym_rate > easy.scene.text_synonym_rate);
+        assert!(medium.scene.text_typo_rate > easy.scene.text_typo_rate);
+
+        assert_eq!(hard.scene.text_reference_frame, TextReferenceFrame::Mixed);
+        assert!(hard.scene.text_synonym_rate > medium.scene.text_synonym_rate);
+        assert!(hard.scene.text_typo_rate > medium.scene.text_typo_rate);
+    }
+
+    #[test]
+    fn difficulty_levels_apply_text_alteration_profile_ladder() {
+        assert_eq!(
+            text_alteration_profile_for_difficulty(Difficulty::Easy),
+            TextAlterationProfile::Canonical
+        );
+        assert_eq!(
+            text_alteration_profile_for_difficulty(Difficulty::Medium),
+            TextAlterationProfile::EventClauseReordered
+        );
+        assert_eq!(
+            text_alteration_profile_for_difficulty(Difficulty::Hard),
+            TextAlterationProfile::FullyReordered
+        );
+    }
+
+    #[test]
+    fn modality_order_roundtrip_and_shape_constraints() {
+        let canonical = canonical_modality_order();
+        let serialized = serialize_modality_order(&canonical);
+        let parsed = parse_modality_order(&serialized).expect("roundtrip should parse");
+        assert_eq!(parsed, canonical);
+
+        assert!(parse_modality_order("0,1,2,3").is_err());
+        assert!(parse_modality_order("0,1,2,3,5").is_err());
+        assert!(parse_modality_order("0,1,1,3,4").is_err());
+    }
+
+    #[test]
+    fn modality_order_from_seed_is_deterministic_permutation() {
+        let first = modality_order_from_seed(12345);
+        let second = modality_order_from_seed(12345);
+        assert_eq!(first, second);
+
+        let mut seen = [false; MODALITY_COUNT];
+        for index in first {
+            assert!(index < MODALITY_COUNT);
+            assert!(!seen[index]);
+            seen[index] = true;
+        }
+        assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn build_plan_item_with_modality_order_uses_requested_task_order() {
+        let seed = 42;
+        let difficulty = Difficulty::Easy;
+        let modality_targets = modality_targets_from_seed(seed);
+        let reversed_order = [4, 3, 2, 1, 0];
+
+        let first_item = build_plan_item_with_modality_order(
+            seed,
+            difficulty,
+            &modality_targets,
+            &reversed_order,
+            0,
+        )
+        .expect("first item should build");
+        assert_eq!(first_item.modality, Modality::Sound);
+
+        let second_block_item = build_plan_item_with_modality_order(
+            seed,
+            difficulty,
+            &modality_targets,
+            &reversed_order,
+            SCENES_PER_MODALITY,
+        )
+        .expect("second block item should build");
+        assert_eq!(second_block_item.modality, Modality::Tabular);
+    }
+
+    #[test]
+    fn plan_item_query_shape_matches_generated_scene_across_difficulties_and_modalities() {
+        let seeds = [42_u64, (1_u64 << 16) + 1337, (1_u64 << 17) + 42];
+        let difficulties = [Difficulty::Easy, Difficulty::Medium, Difficulty::Hard];
+
+        for seed in seeds {
+            let modality_targets = modality_targets_from_seed(seed);
+            for difficulty in difficulties {
+                for item_index in 0..total_items() {
+                    let item = build_plan_item(seed, difficulty, &modality_targets, item_index)
+                        .expect("plan item should build");
+                    let Some(query_shape_id) = item.query_shape.as_ref() else {
+                        continue;
+                    };
+
+                    let scene = build_scene_for_seed(seed, difficulty, item.scene_index)
+                        .expect("scene should build for plan item");
+                    let has_query_shape = (0..scene.shape_paths.len()).any(|shape_index| {
+                        shapeflow_core::tabular_encoding::shape_identity_for_scene(
+                            &scene,
+                            shape_index,
+                        )
+                        .map(|identity| identity.shape_id == *query_shape_id)
+                        .unwrap_or(false)
+                    });
+
+                    assert!(
+                        has_query_shape,
+                        "query shape '{query_shape_id}' missing from scene: seed={seed} difficulty={difficulty:?} item_index={item_index} scene_index={}",
+                        item.scene_index
+                    );
+                }
+            }
+        }
     }
 }

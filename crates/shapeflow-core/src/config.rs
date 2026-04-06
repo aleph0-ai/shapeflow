@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_MASTER_SEED_EXCLUSIVE: u64 = 1u64 << 16;
+
+fn dataset_version_major_minor() -> (u64, u64) {
+    let major = env!("CARGO_PKG_VERSION_MAJOR")
+        .parse::<u64>()
+        .expect("CARGO_PKG_VERSION_MAJOR must be an integer");
+    let minor = env!("CARGO_PKG_VERSION_MINOR")
+        .parse::<u64>()
+        .expect("CARGO_PKG_VERSION_MINOR must be an integer");
+    (major, minor)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -108,6 +119,8 @@ pub enum ConfigError {
     MotionEventsRandomRangesMinExceedsCap { min_total: u32, cap: u32 },
     #[error("failed to serialize canonical hash payload: {0}")]
     CanonicalHashSerialization(String),
+    #[error("Please use seeds below 2^16")]
+    MasterSeedOutOfRange,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -278,8 +291,17 @@ pub struct ParallelismConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigIdentity {
+    pub config_hash: [u8; 32],
+    pub config_hash_hex: String,
+    pub generation_profile: Option<GenerationProfileConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatasetIdentity {
     pub master_seed: u64,
+    pub dataset_version_major: u64,
+    pub dataset_version_minor: u64,
     pub config_hash: [u8; 32],
     pub config_hash_hex: String,
     pub generation_profile: Option<GenerationProfileConfig>,
@@ -510,6 +532,9 @@ impl ShapeFlowConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.master_seed >= MAX_MASTER_SEED_EXCLUSIVE {
+            return Err(ConfigError::MasterSeedOutOfRange);
+        }
         if self.schema_version != CURRENT_SCHEMA_VERSION {
             return Err(ConfigError::UnsupportedSchemaVersion {
                 found: self.schema_version,
@@ -790,14 +815,26 @@ impl ShapeFlowConfig {
         Ok(hex::encode(self.config_hash()?))
     }
 
-    pub fn dataset_identity(&self) -> Result<DatasetIdentity, ConfigError> {
+    pub fn config_identity(&self) -> Result<ConfigIdentity, ConfigError> {
         let config_hash = self.config_hash()?;
         let config_hash_hex = hex::encode(config_hash);
-        Ok(DatasetIdentity {
-            master_seed: self.master_seed,
+        Ok(ConfigIdentity {
             config_hash,
             config_hash_hex,
             generation_profile: self.generation_profile.clone(),
+        })
+    }
+
+    pub fn dataset_identity(&self) -> Result<DatasetIdentity, ConfigError> {
+        let config_identity = self.config_identity()?;
+        let (dataset_version_major, dataset_version_minor) = dataset_version_major_minor();
+        Ok(DatasetIdentity {
+            master_seed: self.master_seed,
+            dataset_version_major,
+            dataset_version_minor,
+            config_hash: config_identity.config_hash,
+            config_hash_hex: config_identity.config_hash_hex,
+            generation_profile: config_identity.generation_profile,
         })
     }
 }
@@ -900,6 +937,35 @@ num_threads = 4
         let hash_a = cfg_a.config_hash().expect("hash must compute");
         let hash_b = cfg_b.config_hash().expect("hash must compute");
         assert_eq!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn config_identity_excludes_master_seed() {
+        let cfg_a = sample_config();
+        let mut cfg_b = sample_config();
+        cfg_b.master_seed = 9999;
+
+        let identity_a = cfg_a
+            .config_identity()
+            .expect("config identity must compute");
+        let identity_b = cfg_b
+            .config_identity()
+            .expect("config identity must compute");
+        assert_eq!(identity_a.config_hash, identity_b.config_hash);
+        assert_eq!(identity_a.config_hash_hex, identity_b.config_hash_hex);
+    }
+
+    #[test]
+    fn dataset_identity_includes_master_seed_and_dataset_version() {
+        let cfg = sample_config();
+        let identity = cfg
+            .dataset_identity()
+            .expect("dataset identity must compute");
+        let (expected_major, expected_minor) = dataset_version_major_minor();
+
+        assert_eq!(identity.master_seed, cfg.master_seed);
+        assert_eq!(identity.dataset_version_major, expected_major);
+        assert_eq!(identity.dataset_version_minor, expected_minor);
     }
 
     #[test]
@@ -1124,6 +1190,15 @@ num_threads = 4
         let cfg = ShapeFlowConfig::baseline(1234);
         assert!(cfg.validate().is_ok());
         assert!(cfg.generation_profile.is_none());
+    }
+
+    #[test]
+    fn validation_rejects_master_seed_in_reserved_range() {
+        let mut cfg = sample_config();
+        cfg.master_seed = MAX_MASTER_SEED_EXCLUSIVE;
+        let err = cfg.validate().expect_err("config should fail validation");
+        assert!(matches!(err, ConfigError::MasterSeedOutOfRange));
+        assert_eq!(err.to_string(), "Please use seeds below 2^16");
     }
 
     #[test]

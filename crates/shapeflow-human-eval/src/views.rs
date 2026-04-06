@@ -47,7 +47,7 @@ pub fn render_setup_page() -> Markup {
                                 ("hard", "Hard", "5 shapes, complex motion"),
                             ] {
                                 label class="difficulty-card" {
-                                    input type="radio" name="difficulty" value=(value) checked[value == "easy"];
+                                    input type="radio" name="difficulty" value=(value) checked[value == "medium"];
                                     div class="difficulty-card-inner" {
                                         span class="difficulty-label" { (label) }
                                         span class="difficulty-desc" { (desc) }
@@ -594,6 +594,13 @@ pub fn render_ratings_fragment(session_uuid: &str) -> Markup {
     }
 }
 
+pub fn render_ratings_page(session_uuid: &str) -> Markup {
+    page_layout(
+        "ShapeFlow Human Evaluation",
+        render_ratings_fragment(session_uuid),
+    )
+}
+
 pub fn render_completion_fragment() -> Markup {
     html! {
         section #task-panel class="task-panel completion-panel" {
@@ -617,6 +624,10 @@ pub fn render_error_fragment(message: &str) -> Markup {
             }
         }
     }
+}
+
+pub fn render_error_page(message: &str) -> Markup {
+    page_layout("ShapeFlow Human Evaluation", render_error_fragment(message))
 }
 
 fn page_layout(title: &str, content: Markup) -> Markup {
@@ -669,7 +680,7 @@ pub fn render_debug_navigator() -> Markup {
                         div class="difficulty-options" {
                             @for (value, label) in [("easy", "Easy"), ("medium", "Medium"), ("hard", "Hard")] {
                                 label class="difficulty-card" {
-                                    input type="radio" name="difficulty" value=(value) checked[value == "easy"];
+                                    input type="radio" name="difficulty" value=(value) checked[value == "medium"];
                                     div class="difficulty-card-inner" {
                                         span class="difficulty-label" { (label) }
                                     }

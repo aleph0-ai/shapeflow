@@ -7,6 +7,7 @@ It is a Rust workspace with:
 - `shapeflow-core`: source-of-truth generation and validation logic
 - `shapeflow-cli` (binary: `shapeflow`): operational tooling
 - `shapeflow-py` (Python module: `shapeflow`): thin PyO3 bridge to core
+- `shapeflow-human-eval`: human-eval web server and database integration
 
 The system generates aligned modalities from one shared latent scene, then validates deterministic invariants and generated artifacts.
 
@@ -15,7 +16,7 @@ The system generates aligned modalities from one shared latent scene, then valid
 For each scene, ShapeFlow can produce:
 
 - latent artifact: `latent/{scene_id}.bin` (`SFLA`)
-- targets: `targets/{scene_id}_oqp{shape}.sft` (`SFTT`)
+- targets: `targets/{scene_id}_{task_id}.sft` (`SFTT`)
 - site graph: `metadata/site_graph.sfg` (`SFGR`)
 - tabular: `tabular/{scene_id}.csv`
 - text: `text/{scene_id}.txt`
@@ -24,9 +25,15 @@ For each scene, ShapeFlow can produce:
 - sound: `sound/{scene_id}.wav`
 - metadata: `metadata/*.toml`
 
-The current target task exposed in CLI/Python is:
+Current target task families generated:
 
 - `oqp` (ordered quadrant passage)
+- `xct` (quadrant crossing count)
+- `zqh` (quadrant after moves)
+- `lme` (largest single-motion shape)
+
+Task IDs follow the family-prefix pattern, for example `oqp0000`, `xct0000`, `zqh0000`, and `lme0000`.
+Target selectors in CLI/Python accept `all`, exact task ids, and family prefixes.
 
 ## Workspace Layout
 
@@ -37,7 +44,8 @@ The current target task exposed in CLI/Python is:
 ├── crates/                # Workspace crates
 │   ├── shapeflow-core/    # Source-of-truth generation/validation/serialization logic
 │   ├── shapeflow-cli/     # CLI binary and command orchestration
-│   └── shapeflow-py/      # PyO3 bindings + Python packaging assets
+│   ├── shapeflow-py/      # PyO3 bindings + Python packaging assets
+│   └── shapeflow-human-eval/ # Human-eval web server backend
 ├── Justfile               # Common dev/check/proof command shortcuts
 ├── pyproject.toml         # Python package build metadata (maturin)
 └── Cargo.toml             # Rust workspace manifest
@@ -52,7 +60,7 @@ The current target task exposed in CLI/Python is:
 
 ## Quick Start
 
-### 1) Compute dataset identity from config
+### 1) Compute config and dataset identities from config
 
 ```bash
 cargo run -p shapeflow-cli -- hash-config --config configs/bootstrap.toml
@@ -61,8 +69,10 @@ cargo run -p shapeflow-cli -- hash-config --config configs/bootstrap.toml
 Expected output shape:
 
 ```text
-master_seed=42
 config_hash=<sha256-hex>
+master_seed=42
+dataset_version_major=<major>
+dataset_version_minor=<minor>
 ```
 
 ### 2) Generate a dataset slice
@@ -75,16 +85,37 @@ cargo run -p shapeflow-cli -- generate \
   --samples-per-event 24
 ```
 
+Metadata files written:
+
+```text
+metadata/config.toml
+metadata/site_graph.sfg
+metadata/site_metadata.toml
+metadata/split_assignments.toml
+metadata/materialization.toml
+```
+
 Example output:
 
 ```text
 generation=ok
 output=/tmp/shapeflow-out
-scene_count=2, samples_per_event=24, target_file_count=4, ...
-config_hash=<sha256-hex>  # run-derived from schema + current config
+config_hash=<sha256-hex>  # derived from config payload; excludes master_seed and schema_version
 ```
 
-### 3) Validate generation-time invariants
+### 3) Generate targets for one scene (task selector)
+
+```bash
+cargo run -p shapeflow-cli -- targets \
+  --config configs/bootstrap.toml \
+  --scene-index 0 \
+  --samples-per-event 24 \
+  --task-id oqp
+```
+
+`--task-id` accepts `all`, exact task ids like `oqp0000`, and family prefixes like `oqp`.
+
+### 4) Validate generation-time invariants
 
 ```bash
 cargo run -p shapeflow-cli -- validate \
@@ -99,7 +130,7 @@ cargo run -p shapeflow-cli -- validate \
   --samples-per-event 24
 ```
 
-### 4) Render one-scene human-readable preview artifacts
+### 5) Render one-scene human-readable preview artifacts
 
 ```bash
 cargo run -p shapeflow-cli -- preview \
@@ -109,7 +140,13 @@ cargo run -p shapeflow-cli -- preview \
   --samples-per-event 24
 ```
 
-### 5) Validate generated artifacts against deterministic recomputation
+### 6) Run human-eval server
+
+```bash
+cargo run -p shapeflow-cli -- human-eval --bind 127.0.0.1:8080 --debug
+```
+
+### 7) Validate generated artifacts against deterministic recomputation
 
 ```bash
 cargo run -p shapeflow-cli -- validate \
@@ -135,12 +172,14 @@ cargo run -p shapeflow-cli -- --help
 Commands:
 
 - `generate`: materialize deterministic canonical artifacts
-- `hash-config`: print `master_seed` and `config_hash`
+- `targets`: generate deterministic targets for one scene with task selector (`all`, exact id, or prefix)
+- `hash-config`: print `config_hash`, `master_seed`, and dataset major/minor version
 - `export-split`: export a selected split from an existing generated dataset
 - `inspect-scene`: inspect one deterministic scene and print scene-level metrics
 - `preview`: render one deterministic scene into human-readable artifact files
 - `site-stats`: report site-graph metrics from recomputation or generated artifacts
 - `validate`: run one or more validation slices
+- `human-eval`: run the human-evaluation web server
 
 ### `export-split`
 
@@ -196,10 +235,41 @@ Options:
   --samples-per-event <SAMPLES_PER_EVENT> [default: 24]
 ```
 
+### `targets`
+
+```text
+Usage: shapeflow targets [OPTIONS] --config <CONFIG>
+
+Options:
+  --config <CONFIG>
+  --scene-index <SCENE_INDEX>            [default: 0]
+  --samples-per-event <SAMPLES_PER_EVENT> [default: 24]
+  --task-id <TASK_ID>                    [default: all]
+```
+
+`--task-id` accepts `all`, exact task ids like `oqp0000`, and family prefixes like `oqp`.
+
 ### `site-stats`
 
 ```text
 Usage: shapeflow site-stats --config <CONFIG> [--generated-output <GENERATED_OUTPUT>]
+```
+
+### `human-eval`
+
+```text
+Usage: shapeflow human-eval [OPTIONS]
+
+Options:
+  --bind <BIND>                          [default: 127.0.0.1:8080]
+  --sqlite-path <SQLITE_PATH>            CLI-local SQLite database
+  --database-url <DATABASE_URL>          Optional PostgreSQL connection URL
+  --db-host <DB_HOST>                    Optional PostgreSQL host
+  --db-port <DB_PORT>                    Optional PostgreSQL port
+  --db-user <DB_USER>                    Optional PostgreSQL user
+  --db-password <DB_PASSWORD>            Optional PostgreSQL password
+  --db-name <DB_NAME>                    Optional PostgreSQL database name
+  --debug                                Enable debug mode
 ```
 
 ### `validate`
@@ -231,11 +301,11 @@ If no validation flags are passed, `validate` prints `validation=ok`.
 
 ## Config (TOML)
 
-ShapeFlow uses TOML config files. A minimal valid shape is shown below:
+ShapeFlow uses TOML config files. An example config shape is shown below:
 
 ```toml
 schema_version = 1                              # Config schema version
-master_seed = 42                                # Deterministic master seed; excluded from config_hash
+master_seed = 42                                # Deterministic master seed (< 2^16); excluded from config_hash
 
 [scene]
 resolution = 512                                # Square canvas side in pixels
@@ -271,7 +341,7 @@ x_steepness = 3.0                               # X soft-membership steepness
 y_steepness = 2.0                               # Y soft-membership steepness
 
 [parallelism]
-num_threads = 4                                 # Deterministic worker thread count
+num_threads = 4                                 # Worker thread count
 
 [site_graph]
 site_k = 10                                     # k for k-NN site graph construction
@@ -283,13 +353,19 @@ lambda2_iterations = 64                         # Iterations for lambda2 estimat
 Notes:
 
 - `config_hash` intentionally excludes `master_seed` and `schema_version`.
-- `generation_profile` (when present) participates in `config_hash` as provenance context.
+- `config_identity` is the config-equivalence surface (same concrete config => same hash).
+- `dataset_identity` adds `master_seed` and ShapeFlow crate major/minor version to config identity.
+- `config_hash` is derived from canonical CBOR serialization of the internal config payload, not raw TOML text.
+- TOML formatting/key order/whitespace, and parser-side aliasing, do not affect `config_hash` if they map to the same internal config values.
+- Changes to the core canonical payload definition are versioned in ShapeFlow and may change hashes across minor/major releases by policy.
+- `dataset_identity` does not add a separate composed hash field; compare the tuple `(config_hash, master_seed, dataset_version_major, dataset_version_minor)` for equality checks.
+- `generation_profile` (including `version`) participates in `config_hash` when present.
 - `motion_events_per_shape` and `motion_events_per_shape_random_ranges` are mutually exclusive config sources.
 - `n_motion_slots` controls the fixed slot timeline (image panels/video slots/audio slots), and slots may be empty.
 - `n_motion_events_total` is optional and acts as a cap on total generated events.
 - `randomize_motion_events_per_shape = true` with no `motion_events_per_shape_random_ranges` samples per-shape counts in `[0, n_motion_slots]`, deterministically by scene seed.
 - `motion_events_per_shape_random_ranges` (when present) enables per-shape min/max sampling in `[min, max]`, also deterministic by scene seed.
-- `shape_identity_assignment = "index_locked"` uses fixed index-based identity mapping (current behavior before pair-random mode).
+- `shape_identity_assignment = "index_locked"` uses fixed index-based identity mapping.
 - `shape_identity_assignment = "pair_unique_random"` uses deterministic seed-based (shape, color) pair assignment, allowing duplicate shapes across colors and duplicate colors across shapes.
 - `scene_count` and `samples_per_event` must be `> 0` for generation-backed checks.
 - Split behavior is explicit in generation/materialization commands; it is not an implicit config side-effect.
@@ -323,17 +399,25 @@ uv add "shapeflow @ git+https://github.com/<org>/<repo>.git"
 
 ```python
 from shapeflow import (
+    config_identity,
     dataset_identity,
     generate_batch,
     generate_scene,
     iter_scenes,
     load_targets,
+    materialize_dataset,
 )
 
 config_path = "configs/bootstrap.toml"
 
-identity = dataset_identity(config_path)
-print(identity["master_seed"], identity["config_hash"])
+cfg_id = config_identity(config_path)
+ds_id = dataset_identity(config_path)
+print(cfg_id["config_hash"])
+print(
+    ds_id["master_seed"],
+    ds_id["dataset_version_major"],
+    ds_id["dataset_version_minor"],
+)
 
 scene = generate_scene(
     config_path,
@@ -365,6 +449,13 @@ targets = load_targets(
     task_id="oqp",
     samples_per_event=24,
 )
+
+summary = materialize_dataset(
+    config_path,
+    output_dir="/tmp/shapeflow-out",
+    scene_count=2,
+    samples_per_event=24,
+)
 ```
 
 ### Config-object API
@@ -377,7 +468,7 @@ from shapeflow import (
 )
 
 cfg = ShapeFlowConfig(
-    master_seed=1234,
+    master_seed=42,
     resolution=512,
     n_shapes=3,
     trajectory_complexity=2,
@@ -387,7 +478,6 @@ cfg = ShapeFlowConfig(
     motion_events_per_shape=[4, 4, 4],
     n_motion_events_total=None,
     allow_simultaneous=False,
-    shape_identity_assignment="pair_unique_random",
     sound_sample_rate_hz=44100,
     sound_frames_per_second=24,
     sound_modulation_depth_per_mille=250,
@@ -410,7 +500,7 @@ cfg = ShapeFlowConfig(
 )
 
 cfg = ShapeFlowConfig.with_defaults(
-    master_seed=1234,
+    master_seed=42,
     resolution=512,
     n_shapes=3,
     trajectory_complexity=2,
@@ -420,7 +510,6 @@ cfg = ShapeFlowConfig.with_defaults(
     motion_events_per_shape=[4, 4, 4],
     n_motion_events_total=None,
     allow_simultaneous=False,
-    shape_identity_assignment="pair_unique_random",
     sound_sample_rate_hz=44100,
     sound_frames_per_second=24,
     sound_modulation_depth_per_mille=250,
@@ -438,15 +527,36 @@ cfg = ShapeFlowConfig.with_defaults(
 
 cfg = ShapeFlowConfig.from_policy_with_defaults(
     ShapeFlowConfigPreset.Obstruction,
-    master_seed=1234,
+    master_seed=42,
 )
-# cfg = cfg.apply_policy(ShapeFlowConfigPreset.SpectralGap)
+cfg = cfg.apply_policy(ShapeFlowConfigPreset.SpectralGap)
+
+cfg = ShapeFlowConfig.from_policy(
+    ShapeFlowConfigPreset.Bridging,
+    master_seed=42,
+    resolution=512,
+    event_duration_frames=24,
+    easing_family="ease_in_out",
+    events_per_shape=4,
+    allow_simultaneous=False,
+    sound_sample_rate_hz=44100,
+    sound_frames_per_second=24,
+    sound_modulation_depth_per_mille=250,
+    sound_channel_mapping="stereo_alternating",
+    x_nonlinearity="sigmoid",
+    y_nonlinearity="tanh",
+    lambda2_min=0.05,
+    validation_scene_count=32,
+    lambda2_iterations=64,
+    num_threads=4,
+)
 
 cfg = ShapeFlowConfig.from_toml("configs/bootstrap.toml")
 # Use TOML loading when you need per-shape random range controls:
 # randomize_motion_events_per_shape + motion_events_per_shape_random_ranges.
 
-print(cfg.dataset_identity())  # includes generation_profile + version when preset-backed
+print(cfg.config_identity())   # config-equivalence identity
+print(cfg.dataset_identity())  # config identity + master_seed + dataset major/minor version
 cfg.write_toml("tmp_config.toml")
 
 bridge = ShapeFlowBridge.from_config(cfg)
@@ -464,6 +574,7 @@ Iterator semantics:
 from shapeflow import ShapeFlowBridge
 
 bridge = ShapeFlowBridge("configs/bootstrap.toml")
+config_identity = bridge.config_identity()
 identity = bridge.dataset_identity()
 scene = bridge.generate_scene(0, 24, "soft_quadrants")
 batch = bridge.generate_batch(0, 64, 24, "soft_quadrants")
@@ -473,10 +584,24 @@ targets = bridge.load_targets(0, "oqp", 24)
 
 ### Python return shapes
 
+`config_identity(...)` returns a dict:
+
+- `config_hash: str`
+- `generation_profile: str | None`
+- `generation_profile_version: int | None`
+
 `dataset_identity(...)` returns a dict:
 
 - `master_seed: int`
+- `dataset_version_major: int`
+- `dataset_version_minor: int`
 - `config_hash: str`
+- `generation_profile: str | None`
+- `generation_profile_version: int | None`
+
+Recommended equality comparison key:
+
+- `(config_hash, master_seed, dataset_version_major, dataset_version_minor)`
 
 `generate_scene(...)` returns a dict with:
 
@@ -488,20 +613,20 @@ targets = bridge.load_targets(0, "oqp", 24)
 
 `load_targets(...)` returns a list of targets:
 
-- each target has `shape_index` and `segments`
+- each target has `task_id` and `segments`
 - each segment is `(q1, q2, q3, q4)`
 
 Supported strings:
 
 - projection: `trajectory_only`, `soft_quadrants`
-- task: `oqp` (only)
+- task: `all`, exact task id (e.g. `oqp0000`), or family prefix (`oqp`, `xct`, `zqh`, `lme`)
 
 ## Rust Library Usage (`shapeflow-core`)
 
 ```rust
 use shapeflow_core::{
-    SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig, generate_scene,
-    generate_ordered_quadrant_passage_targets,
+    SceneGenerationParams, SceneProjectionMode, ShapeFlowConfig, build_split_assignments,
+    generate_all_scene_targets, generate_scene, validate_site_graph_with_artifact,
 };
 
 let raw = std::fs::read_to_string("configs/bootstrap.toml")?;
@@ -516,8 +641,11 @@ let params = SceneGenerationParams {
 };
 
 let scene = generate_scene(&params)?;
-let targets = generate_ordered_quadrant_passage_targets(&scene)?;
+let targets = generate_all_scene_targets(&scene)?;
+let split_assignments = build_split_assignments(16)?;
+let _ = validate_site_graph_with_artifact(&config)?;
 println!("shape targets: {}", targets.len());
+println!("split assignment total: {}", split_assignments.summary.total_count);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -531,9 +659,20 @@ println!("shape targets: {}", targets.len());
   - `.bin` latent (`SFLA`)
 - CLI generation computes scene bundles in parallel but sorts by `scene_index` before writing.
 
+## Versioning and Compatibility Policy
+
+ShapeFlow follows a strict data-compatibility policy:
+
+- **Patch releases** (`X.Y.Z -> X.Y.(Z+1)`): guaranteed to be data-compatible.
+  - For the same inputs (`master_seed`, scene index, and effective config), generated artifacts are expected to be bit-identical.
+  - `config_hash` semantics and output artifact schema remain unchanged.
+- **Minor releases** (`X.Y.Z -> X.(Y+1).0`) and **major releases** (`X.Y.Z -> (X+1).0.0`): treated as non-backward-compatible by policy.
+  - Data outputs are not guaranteed to match previous versions.
+  - Cross-version comparisons must assume different outputs and different `config_hash` values.
+
 ## Formal Verification
 
-ShapeFlow treats formal verification as part of release-quality correctness.
+ShapeFlow uses formal verification as part of correctness validation.
 
 Current proof setup:
 
@@ -541,7 +680,7 @@ Current proof setup:
 - Proofs are module-aligned with runtime ownership in `crates/shapeflow-core/src/`.
 - Runtime checks still exist; proofs and tests are complementary.
 
-What is currently machine-proved (high level):
+Currently machine-proved:
 
 - seed schedule determinism and stream-separation models
 - config-hash invariants (`master_seed`/`schema_version` exclusion, payload sensitivity)
@@ -566,8 +705,22 @@ just verus-check
 just lean-check
 ```
 
+## Citation
+
+If you use ShapeFlow, please cite / attribute:
+
+```bibtex
+@software{shapeflow2026,
+  title   = {ShapeFlow: A Deterministic Multimodal Dataset Generator},
+  author  = {Sloboda, Tibor and Yamkovyi, Vladyslav},
+  year    = {2026},
+  version = {1.0.0},
+  url     = {https://github.com/aleph0-ai/shapeflow}
+}
+```
+
 ## License
 
 This project is licensed under **BSD-2-Clause-Patent**.
 
-See [LICENSE](LICENSE) for the full terms, including the explicit patent grant.
+See [LICENSE](LICENSE) for the full terms.

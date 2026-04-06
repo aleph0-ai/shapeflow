@@ -65,7 +65,7 @@ enum Command {
         #[arg(long)]
         split: String,
     },
-    /// Print dataset identity tuple from a TOML config.
+    /// Print config and dataset identities from a TOML config.
     HashConfig {
         /// Path to a ShapeFlow TOML config file.
         #[arg(long)]
@@ -361,13 +361,22 @@ fn run_hash_config(config_path: Utf8PathBuf) -> Result<()> {
     let config = load_config(config_path)?;
     config.validate()?;
 
-    let identity = config.dataset_identity()?;
-    println!("master_seed={}", identity.master_seed);
-    println!("config_hash={}", identity.config_hash_hex);
-    if let Some(profile) = identity.generation_profile {
+    let config_identity = config.config_identity()?;
+    println!("config_hash={}", config_identity.config_hash_hex);
+    if let Some(profile) = config_identity.generation_profile {
         println!("generation_profile={}", profile.name);
         println!("generation_profile_version={}", profile.version);
     }
+    let dataset_identity = config.dataset_identity()?;
+    println!("master_seed={}", dataset_identity.master_seed);
+    println!(
+        "dataset_version_major={}",
+        dataset_identity.dataset_version_major
+    );
+    println!(
+        "dataset_version_minor={}",
+        dataset_identity.dataset_version_minor
+    );
     Ok(())
 }
 

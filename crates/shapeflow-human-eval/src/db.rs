@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use crate::{
     HumanEvalDatabaseConfig,
-    flow::{Difficulty, ModalityTargets},
+    flow::{Difficulty, ModalityOrder, ModalityTargets},
 };
 
 #[derive(Debug, Clone)]
@@ -16,6 +16,13 @@ pub struct SessionRecord {
     pub is_human: bool,
     pub show_answer_validation: bool,
     pub current_item_index: i32,
+    pub next_question_index: i32,
+    pub image_target: String,
+    pub video_target: String,
+    pub text_target: String,
+    pub tabular_target: String,
+    pub sound_target: String,
+    pub modality_order: String,
     pub completed: bool,
 }
 
@@ -67,47 +74,29 @@ pub async fn ensure_schema(pool: &DbPool) -> Result<()> {
     .await
     .context("failed to create idx_human_eval_sessions_seed")?;
 
+    add_column_if_missing(pool, "next_question_index", "INTEGER NOT NULL DEFAULT 0")
+        .await
+        .context("failed to ensure next_question_index column")?;
+    add_column_if_missing(pool, "image_target", "TEXT NOT NULL DEFAULT 'oqp'")
+        .await
+        .context("failed to ensure image_target column")?;
+    add_column_if_missing(pool, "video_target", "TEXT NOT NULL DEFAULT 'oqp'")
+        .await
+        .context("failed to ensure video_target column")?;
+    add_column_if_missing(pool, "text_target", "TEXT NOT NULL DEFAULT 'oqp'")
+        .await
+        .context("failed to ensure text_target column")?;
+    add_column_if_missing(pool, "tabular_target", "TEXT NOT NULL DEFAULT 'oqp'")
+        .await
+        .context("failed to ensure tabular_target column")?;
+    add_column_if_missing(pool, "sound_target", "TEXT NOT NULL DEFAULT 'oqp'")
+        .await
+        .context("failed to ensure sound_target column")?;
+    add_column_if_missing(pool, "modality_order", "TEXT NOT NULL DEFAULT '0,1,2,3,4'")
+        .await
+        .context("failed to ensure modality_order column")?;
+
     if is_postgres(pool) {
-        execute(
-            pool,
-            r#"ALTER TABLE human_eval_sessions
-               ADD COLUMN IF NOT EXISTS image_target TEXT NOT NULL DEFAULT 'oqp'"#,
-        )
-        .await
-        .context("failed to add image_target column")?;
-
-        execute(
-            pool,
-            r#"ALTER TABLE human_eval_sessions
-               ADD COLUMN IF NOT EXISTS video_target TEXT NOT NULL DEFAULT 'oqp'"#,
-        )
-        .await
-        .context("failed to add video_target column")?;
-
-        execute(
-            pool,
-            r#"ALTER TABLE human_eval_sessions
-               ADD COLUMN IF NOT EXISTS text_target TEXT NOT NULL DEFAULT 'oqp'"#,
-        )
-        .await
-        .context("failed to add text_target column")?;
-
-        execute(
-            pool,
-            r#"ALTER TABLE human_eval_sessions
-               ADD COLUMN IF NOT EXISTS tabular_target TEXT NOT NULL DEFAULT 'oqp'"#,
-        )
-        .await
-        .context("failed to add tabular_target column")?;
-
-        execute(
-            pool,
-            r#"ALTER TABLE human_eval_sessions
-               ADD COLUMN IF NOT EXISTS sound_target TEXT NOT NULL DEFAULT 'oqp'"#,
-        )
-        .await
-        .context("failed to add sound_target column")?;
-
         execute(
             pool,
             r#"ALTER TABLE human_eval_sessions
@@ -115,6 +104,19 @@ pub async fn ensure_schema(pool: &DbPool) -> Result<()> {
         )
         .await
         .context("failed to drop start_time column")?;
+    }
+
+    if has_column(pool, "next_question_index")
+        .await
+        .context("failed to check next_question_index column")?
+    {
+        execute(
+            pool,
+            r#"CREATE INDEX IF NOT EXISTS idx_human_eval_sessions_active_next_progress
+               ON human_eval_sessions (completed, next_question_index)"#,
+        )
+        .await
+        .context("failed to create idx_human_eval_sessions_active_next_progress")?;
     }
 
     Ok(())
@@ -130,7 +132,9 @@ pub async fn create_session(
     identifier: Option<&str>,
     initial_item_index: i32,
     modality_targets: &ModalityTargets,
+    modality_order: &ModalityOrder,
 ) -> Result<SessionRecord> {
+    let modality_order_serialized = crate::flow::serialize_modality_order(modality_order);
     let sql = if is_postgres(pool) {
         r#"INSERT INTO human_eval_sessions (
             session_id,
@@ -140,12 +144,14 @@ pub async fn create_session(
             show_answer_validation,
             identifier,
             current_item_index,
+            next_question_index,
             image_target,
             video_target,
             text_target,
             tabular_target,
-            sound_target
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            sound_target,
+            modality_order
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING
             session_id,
             seed,
@@ -153,6 +159,13 @@ pub async fn create_session(
             is_human,
             show_answer_validation,
             current_item_index,
+            next_question_index,
+            image_target,
+            video_target,
+            text_target,
+            tabular_target,
+            sound_target,
+            modality_order,
             completed"#
     } else {
         r#"INSERT INTO human_eval_sessions (
@@ -163,12 +176,14 @@ pub async fn create_session(
             show_answer_validation,
             identifier,
             current_item_index,
+            next_question_index,
             image_target,
             video_target,
             text_target,
             tabular_target,
-            sound_target
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            sound_target,
+            modality_order
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         RETURNING
             session_id,
             seed,
@@ -176,6 +191,13 @@ pub async fn create_session(
             is_human,
             show_answer_validation,
             current_item_index,
+            next_question_index,
+            image_target,
+            video_target,
+            text_target,
+            tabular_target,
+            sound_target,
+            modality_order,
             completed"#
     };
 
@@ -189,11 +211,13 @@ pub async fn create_session(
                 .bind(show_answer_validation)
                 .bind(identifier)
                 .bind(initial_item_index)
+                .bind(initial_item_index)
                 .bind(modality_targets[0].as_str())
                 .bind(modality_targets[1].as_str())
                 .bind(modality_targets[2].as_str())
                 .bind(modality_targets[3].as_str())
                 .bind(modality_targets[4].as_str())
+                .bind(&modality_order_serialized)
                 .fetch_one(pg)
                 .await
                 .context("failed to insert new session row")?;
@@ -208,11 +232,13 @@ pub async fn create_session(
                 .bind(show_answer_validation)
                 .bind(identifier)
                 .bind(initial_item_index)
+                .bind(initial_item_index)
                 .bind(modality_targets[0].as_str())
                 .bind(modality_targets[1].as_str())
                 .bind(modality_targets[2].as_str())
                 .bind(modality_targets[3].as_str())
                 .bind(modality_targets[4].as_str())
+                .bind(&modality_order_serialized)
                 .fetch_one(sqlite)
                 .await
                 .context("failed to insert new session row")?;
@@ -230,6 +256,13 @@ pub async fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<Sessi
             is_human,
             show_answer_validation,
             current_item_index,
+            next_question_index,
+            image_target,
+            video_target,
+            text_target,
+            tabular_target,
+            sound_target,
+            modality_order,
             completed
         FROM human_eval_sessions
         WHERE session_id = $1"#
@@ -241,6 +274,13 @@ pub async fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<Sessi
             is_human,
             show_answer_validation,
             current_item_index,
+            next_question_index,
+            image_target,
+            video_target,
+            text_target,
+            tabular_target,
+            sound_target,
+            modality_order,
             completed
         FROM human_eval_sessions
         WHERE session_id = ?1"#
@@ -300,12 +340,13 @@ pub async fn record_answer(
         "UPDATE human_eval_sessions
             SET
                 current_item_index = {p1},
+                next_question_index = {p1},
                 {correct_field} = {correct_field} + {p2},
                 {wrong_field} = {wrong_field} + {p3},
                 updated_at = {now_expr}
             WHERE session_id = {p4}
               AND completed = FALSE
-              AND current_item_index = {p5}
+              AND next_question_index = {p5}
             RETURNING
                 session_id,
                 seed,
@@ -313,6 +354,13 @@ pub async fn record_answer(
                 is_human,
                 show_answer_validation,
                 current_item_index,
+                next_question_index,
+                image_target,
+                video_target,
+                text_target,
+                tabular_target,
+                sound_target,
+                modality_order,
                 completed"
     );
 
@@ -454,7 +502,9 @@ fn create_table_sql(pool: &DbPool) -> &'static str {
             text_target TEXT NOT NULL DEFAULT 'oqp',
             tabular_target TEXT NOT NULL DEFAULT 'oqp',
             sound_target TEXT NOT NULL DEFAULT 'oqp',
+            modality_order TEXT NOT NULL DEFAULT '0,1,2,3,4',
             current_item_index INTEGER NOT NULL DEFAULT 0,
+            next_question_index INTEGER NOT NULL DEFAULT 0,
             completed BOOLEAN NOT NULL DEFAULT FALSE,
 
             image_correct INTEGER NOT NULL DEFAULT 0,
@@ -490,7 +540,9 @@ fn create_table_sql(pool: &DbPool) -> &'static str {
             text_target TEXT NOT NULL DEFAULT 'oqp',
             tabular_target TEXT NOT NULL DEFAULT 'oqp',
             sound_target TEXT NOT NULL DEFAULT 'oqp',
+            modality_order TEXT NOT NULL DEFAULT '0,1,2,3,4',
             current_item_index INTEGER NOT NULL DEFAULT 0,
+            next_question_index INTEGER NOT NULL DEFAULT 0,
             completed INTEGER NOT NULL DEFAULT 0,
 
             image_correct INTEGER NOT NULL DEFAULT 0,
@@ -536,6 +588,13 @@ fn decode_session_row_pg(row: &sqlx::postgres::PgRow) -> Result<SessionRecord> {
         is_human: row.try_get("is_human")?,
         show_answer_validation: row.try_get("show_answer_validation")?,
         current_item_index: row.try_get("current_item_index")?,
+        next_question_index: row.try_get("next_question_index")?,
+        image_target: row.try_get("image_target")?,
+        video_target: row.try_get("video_target")?,
+        text_target: row.try_get("text_target")?,
+        tabular_target: row.try_get("tabular_target")?,
+        sound_target: row.try_get("sound_target")?,
+        modality_order: row.try_get("modality_order")?,
         completed: row.try_get("completed")?,
     })
 }
@@ -548,6 +607,13 @@ fn decode_session_row_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<SessionRec
         is_human: row.try_get("is_human")?,
         show_answer_validation: row.try_get("show_answer_validation")?,
         current_item_index: row.try_get("current_item_index")?,
+        next_question_index: row.try_get("next_question_index")?,
+        image_target: row.try_get("image_target")?,
+        video_target: row.try_get("video_target")?,
+        text_target: row.try_get("text_target")?,
+        tabular_target: row.try_get("tabular_target")?,
+        sound_target: row.try_get("sound_target")?,
+        modality_order: row.try_get("modality_order")?,
         completed: row.try_get("completed")?,
     })
 }
@@ -580,4 +646,49 @@ fn placeholder(pool: &DbPool, index: usize) -> String {
     } else {
         format!("?{index}")
     }
+}
+
+async fn has_column(pool: &DbPool, column_name: &str) -> Result<bool> {
+    match pool {
+        DbPool::Postgres(pg) => {
+            let row = sqlx::query(
+                r#"SELECT 1
+                   FROM information_schema.columns
+                   WHERE table_name = $1
+                     AND column_name = $2
+                   LIMIT 1"#,
+            )
+            .bind("human_eval_sessions")
+            .bind(column_name)
+            .fetch_optional(pg)
+            .await
+            .context("failed to query postgres column metadata")?;
+            Ok(row.is_some())
+        }
+        DbPool::Sqlite(sqlite) => {
+            let row = sqlx::query(
+                "SELECT 1 FROM pragma_table_info('human_eval_sessions') WHERE name = ?1 LIMIT 1",
+            )
+            .bind(column_name)
+            .fetch_optional(sqlite)
+            .await
+            .context("failed to query sqlite column metadata")?;
+            Ok(row.is_some())
+        }
+    }
+}
+
+async fn add_column_if_missing(
+    pool: &DbPool,
+    column_name: &str,
+    column_definition: &str,
+) -> Result<()> {
+    if has_column(pool, column_name).await? {
+        return Ok(());
+    }
+
+    let sql =
+        format!("ALTER TABLE human_eval_sessions ADD COLUMN {column_name} {column_definition}");
+    execute(pool, &sql).await?;
+    Ok(())
 }

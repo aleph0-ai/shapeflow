@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use rand_chacha::ChaCha8Rng;
 
 use crate::config::{EasingFamily, SceneConfig, TextReferenceFrame};
@@ -334,13 +335,25 @@ pub fn generate_scene_text_lines_with_scene_config(
     scene: &SceneGenerationOutput,
     scene_cfg: &SceneConfig,
 ) -> Result<Vec<String>, TextSemanticsError> {
+    generate_scene_text_lines_with_scene_config_and_alteration(
+        scene,
+        scene_cfg,
+        TextAlterationProfile::Canonical,
+    )
+}
+
+pub fn generate_scene_text_lines_with_scene_config_and_alteration(
+    scene: &SceneGenerationOutput,
+    scene_cfg: &SceneConfig,
+    profile: TextAlterationProfile,
+) -> Result<Vec<String>, TextSemanticsError> {
     let mut grammar_rng = scene.schedule.text_grammar_rng();
     let mut lexical_rng = scene.schedule.lexical_noise_rng();
     let semantics = derive_scene_text_semantics(scene)?;
     let options = TextSurfaceOptions::from_scene_config(scene_cfg);
     Ok(render_scene_text_lines_from_semantics(
         &semantics,
-        TextAlterationProfile::Canonical,
+        profile,
         options,
         &mut grammar_rng,
         &mut lexical_rng,
@@ -677,57 +690,591 @@ fn apply_text_surface_variation(
     typo_rate: f64,
     lexical_rng: &mut ChaCha8Rng,
 ) -> String {
-    let line = if should_apply_from_probability(synonym_rate, lexical_rng) {
-        apply_random_replacement(line, &SYNONYM_REPLACEMENTS, lexical_rng)
-    } else {
-        line
-    };
-
-    if should_apply_from_probability(typo_rate, lexical_rng) {
-        apply_random_replacement(line, &TYPO_REPLACEMENTS, lexical_rng)
-    } else {
-        line
-    }
+    let line = apply_per_word_synonyms(line, synonym_rate, lexical_rng);
+    apply_per_word_keyboard_typos(line, typo_rate, lexical_rng)
 }
 
-const SYNONYM_REPLACEMENTS: [(&str, &str); 1] = [("moved", "translated")];
+const SYNONYM_CANONICAL_TOKENS: [&str; 5] = ["moved", "happened", "same", "relative", "scene"];
 
-const TYPO_REPLACEMENTS: [(&str, &str); 3] = [
-    ("Event ", "Evnet "),
-    ("Pair ", "Piar "),
-    (" shape moved", " shpae moved"),
+const TYPO_KEYBOARD_RADIUS: usize = 1;
+
+const QWERTY_NEIGHBOR_GROUPS: [(char, &str); 26] = [
+    ('q', "12wsa"),
+    ('w', "q23edsa"),
+    ('e', "w34rfds"),
+    ('r', "e45tfd"),
+    ('t', "r56ygf"),
+    ('y', "67uhgt"),
+    ('u', "78ijhy"),
+    ('i', "89okju"),
+    ('o', "90plki"),
+    ('p', "0-[';lo"),
+    ('a', "qwsz<"),
+    ('s', "aqwedxz"),
+    ('d', "erfcxsw"),
+    ('f', "ertgvcd"),
+    ('g', "tyhbvf"),
+    ('h', "yujnbg"),
+    ('j', "uikmnh"),
+    ('k', "iol,mj"),
+    ('l', "op;.,k"),
+    ('z', "asx<"),
+    ('x', "zsdc "),
+    ('c', "xdfv "),
+    ('v', "cfgb "),
+    ('b', "vghn "),
+    ('n', "bhjm "),
+    ('m', "njk, "),
 ];
 
-fn apply_random_replacement(
-    line: String,
-    replacements: &[(&str, &str)],
-    rng: &mut ChaCha8Rng,
-) -> String {
-    let candidate_indices = replacements
-        .iter()
-        .enumerate()
-        .filter_map(|(index, (from, _))| line.contains(from).then_some(index))
-        .collect::<Vec<_>>();
-    if candidate_indices.is_empty() {
+const TYPO_CORRECTION_VOCAB: [&str; 50] = [
+    "Scene",
+    "Event",
+    "Pair",
+    "At",
+    "This",
+    "the",
+    "as",
+    "at",
+    "of",
+    "scene",
+    "motion",
+    "event",
+    "events",
+    "red",
+    "green",
+    "blue",
+    "yellow",
+    "magenta",
+    "cyan",
+    "circle",
+    "star",
+    "triangle",
+    "square",
+    "pentagon",
+    "hexagon",
+    "shape",
+    "moved",
+    "translated",
+    "within",
+    "from",
+    "to",
+    "quadrant",
+    "through",
+    "top",
+    "bottom",
+    "left",
+    "right",
+    "above",
+    "below",
+    "aligned",
+    "horizontally",
+    "vertically",
+    "with",
+    "relative",
+    "center",
+    "same",
+    "time",
+    "happened",
+    "and",
+    "is",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypoClass {
+    Doubling,
+    Omission,
+    Replacement,
+    AdditionAfter,
+    AdditionBefore,
+    PairSwap,
+}
+
+fn apply_per_word_synonyms(line: String, probability: f64, rng: &mut ChaCha8Rng) -> String {
+    if probability <= 0.0 || !probability.is_finite() {
         return line;
     }
 
-    let selected = candidate_indices[(rng.next_u32() as usize) % candidate_indices.len()];
-    let (from, to) = replacements[selected];
-    line.replacen(from, to, 1)
+    let mut output = String::with_capacity(line.len());
+    let mut index = 0usize;
+
+    while index < line.len() {
+        let ch = line[index..]
+            .chars()
+            .next()
+            .expect("index must stay in bounds");
+        if ch.is_ascii_alphabetic() {
+            let start = index;
+            index += ch.len_utf8();
+            while index < line.len() {
+                let next = line[index..]
+                    .chars()
+                    .next()
+                    .expect("index must stay in bounds while scanning token");
+                if next.is_ascii_alphabetic() {
+                    index += next.len_utf8();
+                } else {
+                    break;
+                }
+            }
+
+            let token = &line[start..index];
+            let canonical = token.to_ascii_lowercase();
+            let replacement = synonym_variants_by_canonical()
+                .get(&canonical)
+                .filter(|choices| !choices.is_empty());
+            if let Some(choices) = replacement {
+                if should_apply_from_probability(probability, rng) {
+                    let choice = rng.gen_range(0..choices.len());
+                    output.push_str(&match_token_case(token, &choices[choice]));
+                } else {
+                    output.push_str(token);
+                }
+            } else {
+                output.push_str(token);
+            }
+        } else {
+            output.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+
+    output
+}
+
+fn synonym_variants_by_canonical() -> &'static BTreeMap<String, Vec<String>> {
+    static MAP: OnceLock<BTreeMap<String, Vec<String>>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let dict = thesaurus::dict();
+        let mut out = BTreeMap::<String, Vec<String>>::new();
+        for canonical in SYNONYM_CANONICAL_TOKENS {
+            let Some(raw) = dict.get(canonical) else {
+                continue;
+            };
+            let canonical_lower = canonical.to_ascii_lowercase();
+            let mut variants = raw
+                .iter()
+                .filter_map(|candidate| normalize_synonym_candidate(candidate))
+                .filter(|candidate| candidate != &canonical_lower)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !variants.is_empty() {
+                variants.sort();
+                out.insert(canonical_lower, variants);
+            }
+        }
+        out
+    })
+}
+
+fn synonym_canonical_by_variant() -> &'static BTreeMap<String, String> {
+    static MAP: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut out = BTreeMap::<String, String>::new();
+        for (canonical, variants) in synonym_variants_by_canonical() {
+            for variant in variants {
+                out.entry(variant.clone())
+                    .or_insert_with(|| canonical.clone());
+            }
+        }
+        out
+    })
+}
+
+fn normalize_synonym_candidate(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower
+        .chars()
+        .all(|ch| ch.is_ascii_alphabetic())
+        .then_some(lower)
+}
+
+fn match_token_case(template: &str, replacement_lower: &str) -> String {
+    if template.chars().all(|ch| ch.is_ascii_uppercase()) {
+        replacement_lower.to_ascii_uppercase()
+    } else {
+        let mut chars = template.chars();
+        if let Some(first) = chars.next()
+            && first.is_ascii_uppercase()
+            && chars.all(|ch| ch.is_ascii_lowercase())
+        {
+            let mut replacement = replacement_lower.to_string();
+            if let Some(first_byte) = replacement.get_mut(0..1) {
+                first_byte.make_ascii_uppercase();
+            }
+            return replacement;
+        }
+        replacement_lower.to_string()
+    }
+}
+
+fn apply_per_word_keyboard_typos(line: String, probability: f64, rng: &mut ChaCha8Rng) -> String {
+    if probability <= 0.0 || !probability.is_finite() {
+        return line;
+    }
+
+    let mut output = String::with_capacity(line.len());
+    let mut index = 0usize;
+    while index < line.len() {
+        let ch = line[index..]
+            .chars()
+            .next()
+            .expect("index must stay in bounds");
+        if ch.is_ascii_alphabetic() {
+            let start = index;
+            index += ch.len_utf8();
+            while index < line.len() {
+                let next = line[index..]
+                    .chars()
+                    .next()
+                    .expect("index must stay in bounds while scanning token");
+                if next.is_ascii_alphabetic() {
+                    index += next.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let token = &line[start..index];
+            let token_len = token.chars().count();
+            if token_len >= 4
+                && !is_typo_protected_token(token)
+                && should_apply_from_probability(probability, rng)
+            {
+                if let Some(typo) = apply_random_keyboard_typo(token, TYPO_KEYBOARD_RADIUS, rng) {
+                    output.push_str(&typo);
+                } else {
+                    output.push_str(token);
+                }
+            } else {
+                output.push_str(token);
+            }
+        } else {
+            output.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+    output
+}
+
+fn is_typo_protected_token(token: &str) -> bool {
+    let token_lower = token.to_ascii_lowercase();
+    matches!(token_lower.as_str(), "scene" | "event" | "pair")
+        || synonym_variants_by_canonical().contains_key(&token_lower)
+        || synonym_canonical_by_variant().contains_key(&token_lower)
+}
+
+fn apply_random_keyboard_typo(token: &str, radius: usize, rng: &mut ChaCha8Rng) -> Option<String> {
+    let token_chars = token.chars().collect::<Vec<_>>();
+    if token_chars.is_empty() {
+        return None;
+    }
+
+    let mut classes = [
+        TypoClass::Doubling,
+        TypoClass::Omission,
+        TypoClass::Replacement,
+        TypoClass::AdditionAfter,
+        TypoClass::AdditionBefore,
+        TypoClass::PairSwap,
+    ];
+    for index in (1..classes.len()).rev() {
+        let swap_with = rng.gen_range(0..=index);
+        classes.swap(index, swap_with);
+    }
+
+    for class in classes {
+        if let Some(variant) = apply_keyboard_typo_class(&token_chars, class, radius, rng) {
+            if variant != token {
+                return Some(variant);
+            }
+        }
+    }
+    None
+}
+
+fn apply_keyboard_typo_class(
+    token_chars: &[char],
+    class: TypoClass,
+    radius: usize,
+    rng: &mut ChaCha8Rng,
+) -> Option<String> {
+    let len = token_chars.len();
+    match class {
+        TypoClass::Doubling => {
+            let index = rng.gen_range(0..len);
+            let mut chars = token_chars.to_vec();
+            chars.insert(index + 1, token_chars[index]);
+            Some(chars.into_iter().collect())
+        }
+        TypoClass::Omission => {
+            if len < 2 {
+                return None;
+            }
+            let index = rng.gen_range(0..len);
+            let mut chars = token_chars.to_vec();
+            chars.remove(index);
+            Some(chars.into_iter().collect())
+        }
+        TypoClass::PairSwap => {
+            if len < 2 {
+                return None;
+            }
+            let index = rng.gen_range(0..(len - 1));
+            let mut chars = token_chars.to_vec();
+            chars.swap(index, index + 1);
+            Some(chars.into_iter().collect())
+        }
+        TypoClass::Replacement => {
+            let candidates = token_chars
+                .iter()
+                .enumerate()
+                .filter_map(|(index, ch)| {
+                    let neighbors = keyboard_neighbors_for_char(*ch, radius);
+                    (!neighbors.is_empty()).then_some((index, neighbors))
+                })
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return None;
+            }
+            let choice = rng.gen_range(0..candidates.len());
+            let (index, neighbors) = &candidates[choice];
+            let neighbor = neighbors[rng.gen_range(0..neighbors.len())];
+            let mut chars = token_chars.to_vec();
+            chars[*index] = neighbor;
+            Some(chars.into_iter().collect())
+        }
+        TypoClass::AdditionAfter | TypoClass::AdditionBefore => {
+            let candidates = token_chars
+                .iter()
+                .enumerate()
+                .filter_map(|(index, ch)| {
+                    let neighbors = keyboard_neighbors_for_char(*ch, radius);
+                    (!neighbors.is_empty()).then_some((index, neighbors))
+                })
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return None;
+            }
+            let choice = rng.gen_range(0..candidates.len());
+            let (index, neighbors) = &candidates[choice];
+            let neighbor = neighbors[rng.gen_range(0..neighbors.len())];
+            let mut chars = token_chars.to_vec();
+            let insert_index = match class {
+                TypoClass::AdditionAfter => *index + 1,
+                TypoClass::AdditionBefore => *index,
+                _ => unreachable!("handled by match arm"),
+            };
+            chars.insert(insert_index, neighbor);
+            Some(chars.into_iter().collect())
+        }
+    }
+}
+
+fn keyboard_neighbors_for_char(base: char, radius: usize) -> Vec<char> {
+    if !base.is_ascii_alphabetic() || radius == 0 {
+        return Vec::new();
+    }
+    let base_lower = base.to_ascii_lowercase();
+    let mut visited = std::collections::BTreeSet::<char>::new();
+    let mut queue = std::collections::VecDeque::<(char, usize)>::new();
+    visited.insert(base_lower);
+    queue.push_back((base_lower, 0));
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= radius {
+            continue;
+        }
+        for neighbor in immediate_keyboard_neighbors(current) {
+            if visited.insert(neighbor) {
+                queue.push_back((neighbor, depth + 1));
+            }
+        }
+    }
+
+    visited.remove(&base_lower);
+    let mut out = Vec::with_capacity(visited.len());
+    for mut ch in visited {
+        if base.is_ascii_uppercase() {
+            ch = ch.to_ascii_uppercase();
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn immediate_keyboard_neighbors(base_lower: char) -> Vec<char> {
+    let mut out = Vec::<char>::new();
+
+    if let Some((_, neighbors)) = QWERTY_NEIGHBOR_GROUPS
+        .iter()
+        .find(|(key, _)| *key == base_lower)
+    {
+        for neighbor in neighbors.chars() {
+            if neighbor.is_ascii_alphabetic() && !out.contains(&neighbor) {
+                out.push(neighbor);
+            }
+        }
+    }
+
+    for (key, neighbors) in QWERTY_NEIGHBOR_GROUPS {
+        if neighbors.chars().any(|candidate| candidate == base_lower)
+            && key.is_ascii_alphabetic()
+            && !out.contains(&key)
+        {
+            out.push(key);
+        }
+    }
+
+    out
 }
 
 fn normalize_surface_variants(line: &str) -> String {
-    let mut normalized = line.to_string();
-    for (from, to) in [
-        ("Evnet ", "Event "),
-        ("Piar ", "Pair "),
-        (" shpae moved", " shape moved"),
-        ("translated", "moved"),
-    ] {
-        normalized = normalized.replace(from, to);
+    let mut corrected = String::with_capacity(line.len());
+    let mut index = 0usize;
+    while index < line.len() {
+        let ch = line[index..]
+            .chars()
+            .next()
+            .expect("index must stay in bounds");
+        if ch.is_ascii_alphabetic() {
+            let start = index;
+            index += ch.len_utf8();
+            while index < line.len() {
+                let next = line[index..]
+                    .chars()
+                    .next()
+                    .expect("index must stay in bounds while scanning token");
+                if next.is_ascii_alphabetic() {
+                    index += next.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let token = &line[start..index];
+            let token = normalize_typo_token(token);
+            corrected.push_str(&normalize_synonym_token(&token));
+        } else {
+            corrected.push(ch);
+            index += ch.len_utf8();
+        }
+    }
+
+    let mut normalized = corrected;
+    if normalized.contains("translated") {
+        normalized = normalized.replace("translated", "moved");
     }
     normalized
+}
+
+fn normalize_typo_token(token: &str) -> String {
+    if TYPO_CORRECTION_VOCAB.contains(&token) {
+        return token.to_string();
+    }
+
+    let candidates = TYPO_CORRECTION_VOCAB
+        .iter()
+        .copied()
+        .filter(|canonical| is_single_keyboard_typo_variant(canonical, token, TYPO_KEYBOARD_RADIUS))
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return candidates[0].to_string();
+    }
+
+    token.to_string()
+}
+
+fn normalize_synonym_token(token: &str) -> String {
+    let lower = token.to_ascii_lowercase();
+    if let Some(canonical) = synonym_canonical_by_variant().get(&lower) {
+        return match_token_case(token, canonical);
+    }
+    token.to_string()
+}
+
+fn is_single_keyboard_typo_variant(canonical: &str, observed: &str, radius: usize) -> bool {
+    if canonical == observed {
+        return false;
+    }
+    let canonical_chars = canonical.chars().collect::<Vec<_>>();
+    let observed_chars = observed.chars().collect::<Vec<_>>();
+
+    if canonical_chars.is_empty() || observed_chars.is_empty() {
+        return false;
+    }
+
+    // Class 1: doubling
+    for index in 0..canonical_chars.len() {
+        let mut candidate = canonical_chars.clone();
+        candidate.insert(index + 1, canonical_chars[index]);
+        if candidate == observed_chars {
+            return true;
+        }
+    }
+
+    // Class 2: omission
+    if canonical_chars.len() >= 2 && observed_chars.len() + 1 == canonical_chars.len() {
+        for index in 0..canonical_chars.len() {
+            let mut candidate = canonical_chars.clone();
+            candidate.remove(index);
+            if candidate == observed_chars {
+                return true;
+            }
+        }
+    }
+
+    // Class 3: replacement
+    if canonical_chars.len() == observed_chars.len() {
+        for index in 0..canonical_chars.len() {
+            if canonical_chars[index] == observed_chars[index] {
+                continue;
+            }
+            let neighbors = keyboard_neighbors_for_char(canonical_chars[index], radius);
+            if neighbors.contains(&observed_chars[index]) {
+                let mut candidate = canonical_chars.clone();
+                candidate[index] = observed_chars[index];
+                if candidate == observed_chars {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Classes 4 and 5: insertion after / insertion before
+    if observed_chars.len() == canonical_chars.len() + 1 {
+        for index in 0..canonical_chars.len() {
+            let neighbors = keyboard_neighbors_for_char(canonical_chars[index], radius);
+            for neighbor in &neighbors {
+                let mut after = canonical_chars.clone();
+                after.insert(index + 1, *neighbor);
+                if after == observed_chars {
+                    return true;
+                }
+                let mut before = canonical_chars.clone();
+                before.insert(index, *neighbor);
+                if before == observed_chars {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Class 6: pair swap
+    if canonical_chars.len() >= 2 && canonical_chars.len() == observed_chars.len() {
+        for index in 0..(canonical_chars.len() - 1) {
+            let mut candidate = canonical_chars.clone();
+            candidate.swap(index, index + 1);
+            if candidate == observed_chars {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn should_apply_from_probability(probability: f64, rng: &mut ChaCha8Rng) -> bool {
@@ -1048,6 +1595,7 @@ mod tests {
     use super::*;
     use crate::ShapeFlowConfig;
     use crate::scene_generation::{SceneGenerationParams, SceneProjectionMode, generate_scene};
+    use rand::SeedableRng;
 
     fn bootstrap_config() -> ShapeFlowConfig {
         toml::from_str(include_str!("../../../configs/bootstrap.toml"))
@@ -1138,5 +1686,82 @@ mod tests {
             "Unknown 0000: nonsense".to_string(),
         ];
         assert!(decode_scene_text_semantics(&lines).is_err());
+    }
+
+    #[test]
+    fn text_surface_variation_applies_synonyms_per_word() {
+        let moved_choices = synonym_variants_by_canonical()
+            .get("moved")
+            .expect("moved should have thesaurus variants configured");
+        assert!(!moved_choices.is_empty());
+
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let line = "Event 0000: shape moved, then moved again; moved.".to_string();
+        let varied = apply_text_surface_variation(line.clone(), 1.0, 0.0, &mut rng);
+        assert_ne!(varied, line);
+        let normalized = normalize_surface_variants(&varied);
+        assert_eq!(normalized, line);
+    }
+
+    #[test]
+    fn text_surface_variation_applies_keyboard_typos_per_word() {
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let line = "Event 0000: red circle shape moved.".to_string();
+        let varied = apply_text_surface_variation(line.clone(), 0.0, 1.0, &mut rng);
+        assert_ne!(varied, line);
+        let normalized = normalize_surface_variants(&varied);
+        assert_eq!(normalized, line);
+    }
+
+    #[test]
+    fn keyboard_typo_protects_structure_tokens() {
+        let mut rng = ChaCha8Rng::seed_from_u64(19);
+        let line = "Scene Event Pair event scene pair".to_string();
+        let varied = apply_per_word_keyboard_typos(line.clone(), 1.0, &mut rng);
+        assert_eq!(varied, line);
+    }
+
+    #[test]
+    fn keyboard_neighbor_radius_expands_candidates() {
+        let radius_one = keyboard_neighbors_for_char('q', 1);
+        assert!(radius_one.contains(&'w'));
+        assert!(!radius_one.contains(&'e'));
+
+        let radius_two = keyboard_neighbors_for_char('q', 2);
+        assert!(radius_two.contains(&'e'));
+    }
+
+    #[test]
+    fn keyboard_typo_classes_generate_expected_lengths() {
+        let token = "snake";
+        let chars = token.chars().collect::<Vec<_>>();
+        let mut rng = ChaCha8Rng::seed_from_u64(1234);
+
+        let doubled = apply_keyboard_typo_class(&chars, TypoClass::Doubling, 1, &mut rng)
+            .expect("doubling should produce a typo");
+        assert_eq!(doubled.chars().count(), chars.len() + 1);
+
+        let omitted = apply_keyboard_typo_class(&chars, TypoClass::Omission, 1, &mut rng)
+            .expect("omission should produce a typo");
+        assert_eq!(omitted.chars().count(), chars.len() - 1);
+
+        let replaced = apply_keyboard_typo_class(&chars, TypoClass::Replacement, 1, &mut rng)
+            .expect("replacement should produce a typo");
+        assert_eq!(replaced.chars().count(), chars.len());
+        assert_ne!(replaced, token);
+
+        let added_after = apply_keyboard_typo_class(&chars, TypoClass::AdditionAfter, 1, &mut rng)
+            .expect("addition-after should produce a typo");
+        assert_eq!(added_after.chars().count(), chars.len() + 1);
+
+        let added_before =
+            apply_keyboard_typo_class(&chars, TypoClass::AdditionBefore, 1, &mut rng)
+                .expect("addition-before should produce a typo");
+        assert_eq!(added_before.chars().count(), chars.len() + 1);
+
+        let swapped = apply_keyboard_typo_class(&chars, TypoClass::PairSwap, 1, &mut rng)
+            .expect("pair-swap should produce a typo");
+        assert_eq!(swapped.chars().count(), chars.len());
+        assert_ne!(swapped, token);
     }
 }

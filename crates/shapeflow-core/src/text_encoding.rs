@@ -4,6 +4,7 @@ use crate::text_semantics::{
     TextAlterationProfile, TextSemanticsError, decode_scene_text_semantics,
     generate_scene_text_lines_with_alteration,
     generate_scene_text_lines_with_scene_config as generate_scene_text_lines_with_scene_config_semantics,
+    generate_scene_text_lines_with_scene_config_and_alteration as generate_scene_text_lines_with_scene_config_and_alteration_semantics,
 };
 
 pub use crate::text_semantics::TextSemanticsError as TextEncodingError;
@@ -26,6 +27,14 @@ pub fn generate_scene_text_lines_with_scene_config(
     scene_cfg: &SceneConfig,
 ) -> Result<Vec<String>, TextEncodingError> {
     generate_scene_text_lines_with_scene_config_semantics(scene, scene_cfg)
+}
+
+pub fn generate_scene_text_lines_with_scene_config_and_profile(
+    scene: &SceneGenerationOutput,
+    scene_cfg: &SceneConfig,
+    profile: TextAlterationProfile,
+) -> Result<Vec<String>, TextEncodingError> {
+    generate_scene_text_lines_with_scene_config_and_alteration_semantics(scene, scene_cfg, profile)
 }
 
 pub fn assert_text_lines_match_semantics(
