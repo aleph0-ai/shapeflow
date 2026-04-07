@@ -500,6 +500,7 @@ async fn submit_route(
             next_index_i32,
             expected_plan.modality.as_str(),
             is_correct,
+            !expected_plan.is_practice,
         )
         .await
         {

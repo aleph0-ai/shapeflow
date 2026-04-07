@@ -319,6 +319,7 @@ pub async fn record_answer(
     next_item_index: i32,
     modality: &str,
     was_correct: bool,
+    count_toward_totals: bool,
 ) -> Result<SessionRecord> {
     let (correct_field, wrong_field) = match modality {
         "image" => ("image_correct", "image_wrong"),
@@ -335,6 +336,16 @@ pub async fn record_answer(
     let p3 = placeholder(pool, 3);
     let p4 = placeholder(pool, 4);
     let p5 = placeholder(pool, 5);
+    let correct_increment = if count_toward_totals && was_correct {
+        1
+    } else {
+        0
+    };
+    let wrong_increment = if count_toward_totals && !was_correct {
+        1
+    } else {
+        0
+    };
 
     let query = format!(
         "UPDATE human_eval_sessions
@@ -368,8 +379,8 @@ pub async fn record_answer(
         DbPool::Postgres(pg) => {
             let row = sqlx::query(&query)
                 .bind(next_item_index)
-                .bind(if was_correct { 1 } else { 0 })
-                .bind(if was_correct { 0 } else { 1 })
+                .bind(correct_increment)
+                .bind(wrong_increment)
                 .bind(session_id)
                 .bind(expected_item_index)
                 .fetch_one(pg)
@@ -380,8 +391,8 @@ pub async fn record_answer(
         DbPool::Sqlite(sqlite) => {
             let row = sqlx::query(&query)
                 .bind(next_item_index)
-                .bind(if was_correct { 1 } else { 0 })
-                .bind(if was_correct { 0 } else { 1 })
+                .bind(correct_increment)
+                .bind(wrong_increment)
                 .bind(session_id)
                 .bind(expected_item_index)
                 .fetch_one(sqlite)
@@ -691,4 +702,113 @@ async fn add_column_if_missing(
         format!("ALTER TABLE human_eval_sessions ADD COLUMN {column_name} {column_definition}");
     execute(pool, &sql).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flow::{Difficulty, QuestionTarget, canonical_modality_order};
+    use sqlx::Row;
+
+    #[tokio::test]
+    async fn record_answer_counts_scored_items() {
+        let pool = connect_pool(&HumanEvalDatabaseConfig::SqlitePath(":memory:".to_string()))
+            .await
+            .expect("sqlite pool");
+        ensure_schema(&pool).await.expect("schema");
+
+        let targets = [QuestionTarget::OrderedQuadrantPassage; 5];
+        let order = canonical_modality_order();
+        create_session(
+            &pool,
+            "session-counted",
+            123,
+            Difficulty::Easy,
+            true,
+            false,
+            None,
+            0,
+            &targets,
+            &order,
+        )
+        .await
+        .expect("create session");
+
+        record_answer(&pool, "session-counted", 0, 1, "image", true, true)
+            .await
+            .expect("record scored answer");
+
+        let DbPool::Sqlite(sqlite) = &pool else {
+            panic!("expected sqlite pool")
+        };
+        let row = sqlx::query(
+            "SELECT image_correct, image_wrong, next_question_index
+             FROM human_eval_sessions
+             WHERE session_id = ?1",
+        )
+        .bind("session-counted")
+        .fetch_one(sqlite)
+        .await
+        .expect("select counters");
+
+        let image_correct: i64 = row.try_get("image_correct").expect("image_correct");
+        let image_wrong: i64 = row.try_get("image_wrong").expect("image_wrong");
+        let next_question_index: i64 = row
+            .try_get("next_question_index")
+            .expect("next_question_index");
+        assert_eq!(image_correct, 1);
+        assert_eq!(image_wrong, 0);
+        assert_eq!(next_question_index, 1);
+    }
+
+    #[tokio::test]
+    async fn record_answer_skips_practice_item_counters() {
+        let pool = connect_pool(&HumanEvalDatabaseConfig::SqlitePath(":memory:".to_string()))
+            .await
+            .expect("sqlite pool");
+        ensure_schema(&pool).await.expect("schema");
+
+        let targets = [QuestionTarget::OrderedQuadrantPassage; 5];
+        let order = canonical_modality_order();
+        create_session(
+            &pool,
+            "session-practice",
+            123,
+            Difficulty::Easy,
+            true,
+            false,
+            None,
+            0,
+            &targets,
+            &order,
+        )
+        .await
+        .expect("create session");
+
+        record_answer(&pool, "session-practice", 0, 1, "image", false, false)
+            .await
+            .expect("record practice answer");
+
+        let DbPool::Sqlite(sqlite) = &pool else {
+            panic!("expected sqlite pool")
+        };
+        let row = sqlx::query(
+            "SELECT image_correct, image_wrong, next_question_index
+             FROM human_eval_sessions
+             WHERE session_id = ?1",
+        )
+        .bind("session-practice")
+        .fetch_one(sqlite)
+        .await
+        .expect("select counters");
+
+        let image_correct: i64 = row.try_get("image_correct").expect("image_correct");
+        let image_wrong: i64 = row.try_get("image_wrong").expect("image_wrong");
+        let next_question_index: i64 = row
+            .try_get("next_question_index")
+            .expect("next_question_index");
+        assert_eq!(image_correct, 0);
+        assert_eq!(image_wrong, 0);
+        assert_eq!(next_question_index, 1);
+    }
 }

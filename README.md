@@ -669,6 +669,7 @@ ShapeFlow follows a strict data-compatibility policy:
 - **Minor releases** (`X.Y.Z -> X.(Y+1).0`) and **major releases** (`X.Y.Z -> (X+1).0.0`): treated as non-backward-compatible by policy.
   - Data outputs are not guaranteed to match previous versions.
   - Cross-version comparisons must assume different outputs and different `config_hash` values.
+- **Python releases** will follow its own patch versioning disjoint from the Rust crate, but will always match minor and major versions of the Rust crate.
 
 ## Formal Verification
 
