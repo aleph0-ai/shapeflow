@@ -14,6 +14,39 @@ pub fn render_setup_page() -> Markup {
                 div class="panel-header" style="border-bottom:none;padding-bottom:0" {
                     img class="panel-logo" src="/static/shapeflow.svg" alt="ShapeFlow";
                 }
+                section class="setup-intro" {
+                    h3 class="setup-intro-title" { "Welcome, Human or AI" }
+                    p {
+                        "This evaluation measures cross-modal reasoning about shape movement across quadrants, so we can compare where each modality is easier or harder for people and for models."
+                    }
+                    p {
+                        "You will answer 35 total questions across 5 task groups. In each group, the first 2 questions are practice with feedback (10 practice questions total), and the remaining 25 questions are scored."
+                    }
+                    p {
+                        "Some tasks may be too difficult for a human, and some may be too difficult for an AI. That is expected and perfectly fine."
+                    }
+                    p {
+                        "Every question is solvable using only the minimum information provided for that question."
+                    }
+                }
+                section class="setup-quadrant-guide" {
+                    h3 class="setup-intro-title" { "Quadrant Guide" }
+                    p {
+                        "A quadrant is one of four regions created by horizontal and vertical lines crossing at the center."
+                    }
+                    p {
+                        "All tasks relate to movement of shapes in this symmetric quadrant space. Remember the quadrant numbering below, and good luck."
+                    }
+                    div class="quadrant-grid quadrant-grid-static setup-quadrant-grid" {
+                        div class="quadrant-cell" { "2" }
+                        div class="quadrant-cell" { "1" }
+                        div class="quadrant-cell" { "3" }
+                        div class="quadrant-cell" { "4" }
+                    }
+                    p class="setup-quadrant-note" {
+                        "Top-left = 2, top-right = 1, bottom-left = 3, bottom-right = 4."
+                    }
+                }
                 form method="post" action="/start" class="setup-form" {
                     div class="form-group" {
                         span class="form-label" { "Participant Role" }
