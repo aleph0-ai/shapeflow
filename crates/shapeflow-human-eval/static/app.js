@@ -254,7 +254,8 @@ function wireAnswerSubmit(root) {
         var payload = {
             session_uuid: form.elements["session_uuid"].value,
             question_index: Number(form.elements["question_index"].value),
-            answer_text: answerText
+            answer_text: answerText,
+            used_tools: !!(form.elements["used_tools"] && form.elements["used_tools"].checked)
         };
         var response = await fetch(form.getAttribute("action") || "/events", {
             method: "POST",

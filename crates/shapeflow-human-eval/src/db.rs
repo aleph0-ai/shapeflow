@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{PgPool, Row, SqlitePool};
+use sqlx::{PgPool, Row, SqlitePool, migrate::Migrator};
 use std::str::FromStr;
 
 use crate::{
     HumanEvalDatabaseConfig,
     flow::{Difficulty, ModalityOrder, ModalityTargets},
 };
+
+static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
+static SQLITE_MIGRATOR: Migrator = sqlx::migrate!("./migrations/sqlite");
 
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
@@ -54,69 +57,15 @@ pub async fn connect_pool(database: &HumanEvalDatabaseConfig) -> Result<DbPool> 
 }
 
 pub async fn ensure_schema(pool: &DbPool) -> Result<()> {
-    execute(pool, create_table_sql(pool))
-        .await
-        .context("failed to create or verify human_eval_sessions table")?;
-
-    execute(
-        pool,
-        r#"CREATE INDEX IF NOT EXISTS idx_human_eval_sessions_active_progress
-           ON human_eval_sessions (completed, current_item_index)"#,
-    )
-    .await
-    .context("failed to create idx_human_eval_sessions_active_progress")?;
-
-    execute(
-        pool,
-        r#"CREATE INDEX IF NOT EXISTS idx_human_eval_sessions_seed
-           ON human_eval_sessions (seed)"#,
-    )
-    .await
-    .context("failed to create idx_human_eval_sessions_seed")?;
-
-    add_column_if_missing(pool, "next_question_index", "INTEGER NOT NULL DEFAULT 0")
-        .await
-        .context("failed to ensure next_question_index column")?;
-    add_column_if_missing(pool, "image_target", "TEXT NOT NULL DEFAULT 'oqp'")
-        .await
-        .context("failed to ensure image_target column")?;
-    add_column_if_missing(pool, "video_target", "TEXT NOT NULL DEFAULT 'oqp'")
-        .await
-        .context("failed to ensure video_target column")?;
-    add_column_if_missing(pool, "text_target", "TEXT NOT NULL DEFAULT 'oqp'")
-        .await
-        .context("failed to ensure text_target column")?;
-    add_column_if_missing(pool, "tabular_target", "TEXT NOT NULL DEFAULT 'oqp'")
-        .await
-        .context("failed to ensure tabular_target column")?;
-    add_column_if_missing(pool, "sound_target", "TEXT NOT NULL DEFAULT 'oqp'")
-        .await
-        .context("failed to ensure sound_target column")?;
-    add_column_if_missing(pool, "modality_order", "TEXT NOT NULL DEFAULT '0,1,2,3,4'")
-        .await
-        .context("failed to ensure modality_order column")?;
-
-    if is_postgres(pool) {
-        execute(
-            pool,
-            r#"ALTER TABLE human_eval_sessions
-               DROP COLUMN IF EXISTS start_time"#,
-        )
-        .await
-        .context("failed to drop start_time column")?;
-    }
-
-    if has_column(pool, "next_question_index")
-        .await
-        .context("failed to check next_question_index column")?
-    {
-        execute(
-            pool,
-            r#"CREATE INDEX IF NOT EXISTS idx_human_eval_sessions_active_next_progress
-               ON human_eval_sessions (completed, next_question_index)"#,
-        )
-        .await
-        .context("failed to create idx_human_eval_sessions_active_next_progress")?;
+    match pool {
+        DbPool::Postgres(pg) => POSTGRES_MIGRATOR
+            .run(pg)
+            .await
+            .context("failed to run postgres schema migrations")?,
+        DbPool::Sqlite(sqlite) => SQLITE_MIGRATOR
+            .run(sqlite)
+            .await
+            .context("failed to run sqlite schema migrations")?,
     }
 
     Ok(())
@@ -495,100 +444,32 @@ pub async fn store_ratings(
     Ok(())
 }
 
+pub async fn append_used_tools(
+    pool: &DbPool,
+    session_id: &str,
+    question_number: i32,
+) -> Result<()> {
+    append_usage_marker(pool, session_id, "used_tools", question_number).await
+}
+
+pub async fn append_used_data_mcp(
+    pool: &DbPool,
+    session_id: &str,
+    question_number: i32,
+) -> Result<()> {
+    append_usage_marker(pool, session_id, "used_data_mcp", question_number).await
+}
+
+pub async fn append_used_data_route(
+    pool: &DbPool,
+    session_id: &str,
+    question_number: i32,
+) -> Result<()> {
+    append_usage_marker(pool, session_id, "used_data_route", question_number).await
+}
+
 pub fn parse_difficulty(value: &str) -> Result<Difficulty> {
     Difficulty::from_str(value).context("invalid difficulty")
-}
-
-fn create_table_sql(pool: &DbPool) -> &'static str {
-    if is_postgres(pool) {
-        r#"CREATE TABLE IF NOT EXISTS human_eval_sessions (
-            session_id TEXT PRIMARY KEY,
-            seed BIGINT NOT NULL,
-            difficulty TEXT NOT NULL CHECK (difficulty IN ('easy', 'medium', 'hard')),
-            is_human BOOLEAN NOT NULL,
-            show_answer_validation BOOLEAN NOT NULL,
-            identifier TEXT NULL,
-            image_target TEXT NOT NULL DEFAULT 'oqp',
-            video_target TEXT NOT NULL DEFAULT 'oqp',
-            text_target TEXT NOT NULL DEFAULT 'oqp',
-            tabular_target TEXT NOT NULL DEFAULT 'oqp',
-            sound_target TEXT NOT NULL DEFAULT 'oqp',
-            modality_order TEXT NOT NULL DEFAULT '0,1,2,3,4',
-            current_item_index INTEGER NOT NULL DEFAULT 0,
-            next_question_index INTEGER NOT NULL DEFAULT 0,
-            completed BOOLEAN NOT NULL DEFAULT FALSE,
-
-            image_correct INTEGER NOT NULL DEFAULT 0,
-            image_wrong INTEGER NOT NULL DEFAULT 0,
-            video_correct INTEGER NOT NULL DEFAULT 0,
-            video_wrong INTEGER NOT NULL DEFAULT 0,
-            text_correct INTEGER NOT NULL DEFAULT 0,
-            text_wrong INTEGER NOT NULL DEFAULT 0,
-            tabular_correct INTEGER NOT NULL DEFAULT 0,
-            tabular_wrong INTEGER NOT NULL DEFAULT 0,
-            sound_correct INTEGER NOT NULL DEFAULT 0,
-            sound_wrong INTEGER NOT NULL DEFAULT 0,
-
-            image_difficulty_rating SMALLINT CHECK (image_difficulty_rating IS NULL OR image_difficulty_rating BETWEEN 1 AND 5),
-            video_difficulty_rating SMALLINT CHECK (video_difficulty_rating IS NULL OR video_difficulty_rating BETWEEN 1 AND 5),
-            text_difficulty_rating SMALLINT CHECK (text_difficulty_rating IS NULL OR text_difficulty_rating BETWEEN 1 AND 5),
-            tabular_difficulty_rating SMALLINT CHECK (tabular_difficulty_rating IS NULL OR tabular_difficulty_rating BETWEEN 1 AND 5),
-            sound_difficulty_rating SMALLINT CHECK (sound_difficulty_rating IS NULL OR sound_difficulty_rating BETWEEN 1 AND 5),
-
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )"#
-    } else {
-        r#"CREATE TABLE IF NOT EXISTS human_eval_sessions (
-            session_id TEXT PRIMARY KEY,
-            seed INTEGER NOT NULL,
-            difficulty TEXT NOT NULL CHECK (difficulty IN ('easy', 'medium', 'hard')),
-            is_human INTEGER NOT NULL,
-            show_answer_validation INTEGER NOT NULL,
-            identifier TEXT NULL,
-            image_target TEXT NOT NULL DEFAULT 'oqp',
-            video_target TEXT NOT NULL DEFAULT 'oqp',
-            text_target TEXT NOT NULL DEFAULT 'oqp',
-            tabular_target TEXT NOT NULL DEFAULT 'oqp',
-            sound_target TEXT NOT NULL DEFAULT 'oqp',
-            modality_order TEXT NOT NULL DEFAULT '0,1,2,3,4',
-            current_item_index INTEGER NOT NULL DEFAULT 0,
-            next_question_index INTEGER NOT NULL DEFAULT 0,
-            completed INTEGER NOT NULL DEFAULT 0,
-
-            image_correct INTEGER NOT NULL DEFAULT 0,
-            image_wrong INTEGER NOT NULL DEFAULT 0,
-            video_correct INTEGER NOT NULL DEFAULT 0,
-            video_wrong INTEGER NOT NULL DEFAULT 0,
-            text_correct INTEGER NOT NULL DEFAULT 0,
-            text_wrong INTEGER NOT NULL DEFAULT 0,
-            tabular_correct INTEGER NOT NULL DEFAULT 0,
-            tabular_wrong INTEGER NOT NULL DEFAULT 0,
-            sound_correct INTEGER NOT NULL DEFAULT 0,
-            sound_wrong INTEGER NOT NULL DEFAULT 0,
-
-            image_difficulty_rating INTEGER CHECK (image_difficulty_rating IS NULL OR image_difficulty_rating BETWEEN 1 AND 5),
-            video_difficulty_rating INTEGER CHECK (video_difficulty_rating IS NULL OR video_difficulty_rating BETWEEN 1 AND 5),
-            text_difficulty_rating INTEGER CHECK (text_difficulty_rating IS NULL OR text_difficulty_rating BETWEEN 1 AND 5),
-            tabular_difficulty_rating INTEGER CHECK (tabular_difficulty_rating IS NULL OR tabular_difficulty_rating BETWEEN 1 AND 5),
-            sound_difficulty_rating INTEGER CHECK (sound_difficulty_rating IS NULL OR sound_difficulty_rating BETWEEN 1 AND 5),
-
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )"#
-    }
-}
-
-async fn execute(pool: &DbPool, sql: &str) -> Result<()> {
-    match pool {
-        DbPool::Postgres(pg) => {
-            sqlx::query(sql).execute(pg).await?;
-        }
-        DbPool::Sqlite(sqlite) => {
-            sqlx::query(sql).execute(sqlite).await?;
-        }
-    }
-    Ok(())
 }
 
 fn decode_session_row_pg(row: &sqlx::postgres::PgRow) -> Result<SessionRecord> {
@@ -659,48 +540,107 @@ fn placeholder(pool: &DbPool, index: usize) -> String {
     }
 }
 
-async fn has_column(pool: &DbPool, column_name: &str) -> Result<bool> {
+async fn append_usage_marker(
+    pool: &DbPool,
+    session_id: &str,
+    column_name: &str,
+    question_number: i32,
+) -> Result<()> {
     match pool {
         DbPool::Postgres(pg) => {
-            let row = sqlx::query(
-                r#"SELECT 1
-                   FROM information_schema.columns
-                   WHERE table_name = $1
-                     AND column_name = $2
-                   LIMIT 1"#,
-            )
-            .bind("human_eval_sessions")
-            .bind(column_name)
-            .fetch_optional(pg)
-            .await
-            .context("failed to query postgres column metadata")?;
-            Ok(row.is_some())
+            let mut tx = pg
+                .begin()
+                .await
+                .context("failed to begin usage marker transaction")?;
+
+            let select_sql = format!(
+                "SELECT {column_name} FROM human_eval_sessions WHERE session_id = $1 FOR UPDATE"
+            );
+            let row = sqlx::query(&select_sql)
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("failed to load usage marker array")?;
+            let Some(row) = row else {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback missing usage marker session")?;
+                anyhow::bail!("session {session_id} not found");
+            };
+
+            let mut values: Vec<i32> = row
+                .try_get(column_name)
+                .with_context(|| format!("failed to decode {column_name} as integer array"))?;
+            if !values.contains(&question_number) {
+                values.push(question_number);
+            }
+
+            let update_sql = format!(
+                "UPDATE human_eval_sessions
+                 SET {column_name} = $1,
+                     updated_at = NOW()
+                 WHERE session_id = $2"
+            );
+            sqlx::query(&update_sql)
+                .bind(values)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await
+                .context("failed to update usage marker array")?;
+
+            tx.commit()
+                .await
+                .context("failed to commit usage marker transaction")?;
         }
         DbPool::Sqlite(sqlite) => {
-            let row = sqlx::query(
-                "SELECT 1 FROM pragma_table_info('human_eval_sessions') WHERE name = ?1 LIMIT 1",
-            )
-            .bind(column_name)
-            .fetch_optional(sqlite)
-            .await
-            .context("failed to query sqlite column metadata")?;
-            Ok(row.is_some())
+            let mut tx = sqlite
+                .begin()
+                .await
+                .context("failed to begin usage marker transaction")?;
+
+            let select_sql =
+                format!("SELECT {column_name} FROM human_eval_sessions WHERE session_id = ?1");
+            let row = sqlx::query(&select_sql)
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("failed to load usage marker json")?;
+            let Some(row) = row else {
+                tx.rollback()
+                    .await
+                    .context("failed to rollback missing usage marker session")?;
+                anyhow::bail!("session {session_id} not found");
+            };
+
+            let raw_json: String = row
+                .try_get(column_name)
+                .with_context(|| format!("failed to decode {column_name} as text"))?;
+            let mut values: Vec<i32> = serde_json::from_str(&raw_json)
+                .with_context(|| format!("failed to parse {column_name} json array"))?;
+            if !values.contains(&question_number) {
+                values.push(question_number);
+            }
+            let next_json =
+                serde_json::to_string(&values).context("failed to serialize usage marker array")?;
+
+            let update_sql = format!(
+                "UPDATE human_eval_sessions
+                 SET {column_name} = ?1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE session_id = ?2"
+            );
+            sqlx::query(&update_sql)
+                .bind(next_json)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await
+                .context("failed to update usage marker json")?;
+
+            tx.commit()
+                .await
+                .context("failed to commit usage marker transaction")?;
         }
     }
-}
-
-async fn add_column_if_missing(
-    pool: &DbPool,
-    column_name: &str,
-    column_definition: &str,
-) -> Result<()> {
-    if has_column(pool, column_name).await? {
-        return Ok(());
-    }
-
-    let sql =
-        format!("ALTER TABLE human_eval_sessions ADD COLUMN {column_name} {column_definition}");
-    execute(pool, &sql).await?;
     Ok(())
 }
 
@@ -810,5 +750,216 @@ mod tests {
         assert_eq!(image_correct, 0);
         assert_eq!(image_wrong, 0);
         assert_eq!(next_question_index, 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_creates_mcp_http_sessions_table() {
+        let pool = connect_pool(&HumanEvalDatabaseConfig::SqlitePath(":memory:".to_string()))
+            .await
+            .expect("sqlite pool");
+        ensure_schema(&pool).await.expect("schema");
+
+        let DbPool::Sqlite(sqlite) = &pool else {
+            panic!("expected sqlite pool");
+        };
+
+        let table = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mcp_http_sessions'",
+        )
+        .fetch_one(sqlite)
+        .await
+        .expect("mcp_http_sessions table");
+        let table_name: String = table.try_get("name").expect("table name");
+        assert_eq!(table_name, "mcp_http_sessions");
+
+        let columns = sqlx::query("PRAGMA table_info(mcp_http_sessions)")
+            .fetch_all(sqlite)
+            .await
+            .expect("table columns");
+        let column_names: Vec<String> = columns
+            .into_iter()
+            .map(|row| row.try_get("name").expect("column name"))
+            .collect();
+        assert!(
+            column_names
+                .iter()
+                .any(|name| name == "initialize_request_json"),
+            "initialize_request_json column exists"
+        );
+        assert!(
+            column_names.iter().any(|name| name == "rehydrate_count"),
+            "rehydrate_count column exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_usage_markers_updates_json_arrays_in_sqlite() {
+        let pool = connect_pool(&HumanEvalDatabaseConfig::SqlitePath(":memory:".to_string()))
+            .await
+            .expect("sqlite pool");
+        ensure_schema(&pool).await.expect("schema");
+
+        let targets = [QuestionTarget::OrderedQuadrantPassage; 5];
+        let order = canonical_modality_order();
+        create_session(
+            &pool,
+            "session-usage",
+            321,
+            Difficulty::Medium,
+            false,
+            false,
+            None,
+            0,
+            &targets,
+            &order,
+        )
+        .await
+        .expect("create session");
+
+        append_used_tools(&pool, "session-usage", 0)
+            .await
+            .expect("append used_tools");
+        append_used_data_mcp(&pool, "session-usage", 0)
+            .await
+            .expect("append used_data_mcp");
+        append_used_data_route(&pool, "session-usage", 0)
+            .await
+            .expect("append used_data_route");
+        append_used_data_mcp(&pool, "session-usage", 0)
+            .await
+            .expect("append duplicate used_data_mcp");
+        append_used_data_route(&pool, "session-usage", 0)
+            .await
+            .expect("append duplicate used_data_route");
+
+        let DbPool::Sqlite(sqlite) = &pool else {
+            panic!("expected sqlite pool");
+        };
+        let row = sqlx::query(
+            "SELECT used_tools, used_data_mcp, used_data_route
+             FROM human_eval_sessions
+             WHERE session_id = ?1",
+        )
+        .bind("session-usage")
+        .fetch_one(sqlite)
+        .await
+        .expect("select usage columns");
+
+        let used_tools: String = row.try_get("used_tools").expect("used_tools");
+        let used_data_mcp: String = row.try_get("used_data_mcp").expect("used_data_mcp");
+        let used_data_route: String = row.try_get("used_data_route").expect("used_data_route");
+
+        assert_eq!(
+            serde_json::from_str::<Vec<i32>>(&used_tools).expect("decode used_tools"),
+            vec![0]
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<i32>>(&used_data_mcp).expect("decode used_data_mcp"),
+            vec![0]
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<i32>>(&used_data_route).expect("decode used_data_route"),
+            vec![0]
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_creates_session_indexes_and_usage_columns() {
+        let pool = connect_pool(&HumanEvalDatabaseConfig::SqlitePath(":memory:".to_string()))
+            .await
+            .expect("sqlite pool");
+        ensure_schema(&pool).await.expect("schema");
+
+        let DbPool::Sqlite(sqlite) = &pool else {
+            panic!("expected sqlite pool");
+        };
+        let table_columns = sqlx::query("PRAGMA table_info(human_eval_sessions)")
+            .fetch_all(sqlite)
+            .await
+            .expect("human_eval_sessions columns");
+        let column_names: Vec<String> = table_columns
+            .into_iter()
+            .map(|row| row.try_get("name").expect("column name"))
+            .collect();
+        assert!(column_names.iter().any(|name| name == "used_tools"));
+        assert!(column_names.iter().any(|name| name == "used_data_mcp"));
+        assert!(column_names.iter().any(|name| name == "used_data_route"));
+
+        let indexes = sqlx::query("PRAGMA index_list('human_eval_sessions')")
+            .fetch_all(sqlite)
+            .await
+            .expect("human_eval_sessions indexes");
+        let index_names: Vec<String> = indexes
+            .into_iter()
+            .map(|row| row.try_get("name").expect("index name"))
+            .collect();
+        assert!(
+            index_names
+                .iter()
+                .any(|name| name == "idx_human_eval_sessions_active_progress")
+        );
+        assert!(
+            index_names
+                .iter()
+                .any(|name| name == "idx_human_eval_sessions_seed")
+        );
+        assert!(
+            index_names
+                .iter()
+                .any(|name| name == "idx_human_eval_sessions_active_next_progress")
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_cleanup_trigger_removes_stale_mcp_sessions_on_write() {
+        let pool = connect_pool(&HumanEvalDatabaseConfig::SqlitePath(":memory:".to_string()))
+            .await
+            .expect("sqlite pool");
+        ensure_schema(&pool).await.expect("schema");
+
+        let DbPool::Sqlite(sqlite) = &pool else {
+            panic!("expected sqlite pool");
+        };
+
+        sqlx::query(
+            "INSERT INTO mcp_http_sessions (
+                session_id,
+                initialized,
+                closed,
+                initialize_request_json,
+                rehydrate_count,
+                created_at,
+                updated_at,
+                last_seen_at
+            ) VALUES (?1, 1, 0, '{}', 0, ?2, ?2, ?2)",
+        )
+        .bind("stale-session")
+        .bind("2000-01-01 00:00:00")
+        .execute(sqlite)
+        .await
+        .expect("insert stale row");
+
+        sqlx::query(
+            "INSERT INTO mcp_http_sessions (session_id, initialized, closed, initialize_request_json, rehydrate_count)
+             VALUES (?1, 0, 0, NULL, 0)",
+        )
+        .bind("fresh-session")
+        .execute(sqlite)
+        .await
+        .expect("insert fresh row");
+
+        let stale = sqlx::query("SELECT session_id FROM mcp_http_sessions WHERE session_id = ?1")
+            .bind("stale-session")
+            .fetch_optional(sqlite)
+            .await
+            .expect("query stale row");
+        let fresh = sqlx::query("SELECT session_id FROM mcp_http_sessions WHERE session_id = ?1")
+            .bind("fresh-session")
+            .fetch_optional(sqlite)
+            .await
+            .expect("query fresh row");
+
+        assert!(stale.is_none(), "stale session row should be cleaned up");
+        assert!(fresh.is_some(), "fresh session row should remain");
     }
 }

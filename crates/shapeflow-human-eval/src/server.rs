@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
     extract::{Form, Json, Path, State},
@@ -9,14 +9,15 @@ use axum::{
     routing::{get, post},
 };
 use rand::Rng;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{HumanEvalServerConfig, db, flow, flow::Difficulty, mcp::HumanEvalMcpServer, stimulus};
+use crate::{
+    HumanEvalServerConfig, db, flow, flow::Difficulty, mcp::HumanEvalMcpServer,
+    mcp_session::McpSessionManager, stimulus,
+};
 
 const WEB_SESSION_SEED_MIN: u64 = 1u64 << 16;
 const WEB_SESSION_SEED_MAX: u64 = (1u64 << 32) - 1;
@@ -61,6 +62,8 @@ struct EventPayload {
     session_uuid: Uuid,
     question_index: usize,
     answer_text: String,
+    #[serde(default)]
+    used_tools: bool,
 }
 
 #[derive(Deserialize)]
@@ -91,9 +94,10 @@ pub async fn run_server(config: HumanEvalServerConfig) -> Result<()> {
         pool,
         sessions: Arc::new(Mutex::new(HashMap::new())),
     };
+    let mcp_tool_pool = app_state.pool.clone();
     let mcp_service = StreamableHttpService::new(
-        || Ok(HumanEvalMcpServer::new()),
-        LocalSessionManager::default().into(),
+        move || Ok(HumanEvalMcpServer::new_with_pool(mcp_tool_pool.clone())),
+        McpSessionManager::new(&app_state.pool).into(),
         StreamableHttpServerConfig::default(),
     );
 
@@ -116,7 +120,10 @@ pub async fn run_server(config: HumanEvalServerConfig) -> Result<()> {
         .route("/static/style.css", get(css_route))
         .route("/static/app.js", get(js_route))
         .route("/static/shapeflow.svg", get(logo_route))
-        .route("/data/:seed/:difficulty/:modality/:index", get(data_route))
+        .route(
+            "/data/:session_uuid/:seed/:difficulty/:modality/:index",
+            get(data_route),
+        )
         .route("/favicon.ico", get(favicon_route))
         .route("/healthz", get(health_route))
         .nest_service("/mcp", mcp_service);
@@ -360,6 +367,7 @@ fn render_session_page(session_uuid: &Uuid, runtime: &mut RuntimeSession) -> Res
         None
     } else {
         Some(build_ai_native_info(
+            &session_uuid.to_string(),
             runtime.seed,
             runtime.difficulty,
             &plan_item,
@@ -519,6 +527,21 @@ async fn submit_route(
                 );
             }
         };
+        if payload.used_tools {
+            let question_index = match question_index_i32(expected_index) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Html(
+                        crate::views::render_error_fragment(&error.to_string()).into_string(),
+                    );
+                }
+            };
+            if let Err(error) =
+                db::append_used_tools(&state.pool, &session_id, question_index).await
+            {
+                return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            }
+        }
     } else {
         runtime.current_item_index = next_index;
     }
@@ -528,6 +551,7 @@ async fn submit_route(
         None
     } else {
         Some(build_ai_native_info(
+            &payload.session_uuid.to_string(),
             runtime.seed,
             runtime.difficulty,
             &expected_plan,
@@ -592,6 +616,7 @@ async fn proceed_route(
         None
     } else {
         Some(build_ai_native_info(
+            &payload.session_uuid.to_string(),
             runtime.seed,
             runtime.difficulty,
             &next_plan,
@@ -702,16 +727,23 @@ async fn logo_route() -> Response {
 }
 
 async fn data_route(
-    Path((seed, difficulty, modality, index)): Path<(u64, String, String, u32)>,
+    State(state): State<AppState>,
+    Path((session_uuid, seed, difficulty, modality, index)): Path<(
+        String,
+        u64,
+        String,
+        String,
+        u32,
+    )>,
 ) -> Response {
-    let difficulty = match Difficulty::from_str(&difficulty) {
+    let requested_difficulty = match Difficulty::from_str(&difficulty) {
         Ok(value) => value,
         Err(error) => {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
         }
     };
 
-    let modality = match flow::Modality::from_str(&modality.to_ascii_lowercase()) {
+    let requested_modality = match flow::Modality::from_str(&modality.to_ascii_lowercase()) {
         Some(value) => value,
         None => {
             return (
@@ -722,7 +754,96 @@ async fn data_route(
         }
     };
 
-    let payload = match stimulus::build_ai_native_sample(seed, difficulty, modality, index) {
+    let session = match db::get_session(&state.pool, &session_uuid).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return (StatusCode::NOT_FOUND, "session not found").into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    if session.completed {
+        return (StatusCode::FORBIDDEN, "session is already completed").into_response();
+    }
+    if session.next_question_index < 0 {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session progress index is invalid",
+        )
+            .into_response();
+    }
+
+    let item_index = session.next_question_index as usize;
+    if item_index >= flow::total_items() {
+        return (StatusCode::FORBIDDEN, "all questions are complete").into_response();
+    }
+
+    let session_seed = match u64::try_from(session.seed) {
+        Ok(value) => value,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "session seed is invalid").into_response();
+        }
+    };
+    let session_difficulty = match db::parse_difficulty(&session.difficulty) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let modality_targets = match parse_modality_targets_from_record(&session) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let modality_order = match parse_modality_order_from_record(&session) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let current_item = match flow::build_plan_item_with_modality_order(
+        session_seed,
+        session_difficulty,
+        &modality_targets,
+        &modality_order,
+        item_index,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    if seed != session_seed
+        || requested_difficulty != session_difficulty
+        || requested_modality != current_item.modality
+        || index != current_item.scene_index
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "requested data does not match the session's current question",
+        )
+            .into_response();
+    }
+
+    let question_index = match question_index_i32(item_index) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    if let Err(error) =
+        db::append_used_data_route(&state.pool, &session_uuid, question_index).await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+
+    let payload = match stimulus::build_ai_native_sample(
+        session_seed,
+        session_difficulty,
+        requested_modality,
+        index,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
@@ -812,7 +933,12 @@ async fn debug_preview_route(
     let ai_native_info = if is_human {
         None
     } else {
-        Some(build_ai_native_info(seed, difficulty, &item))
+        Some(build_ai_native_info(
+            &session_uuid.to_string(),
+            seed,
+            difficulty,
+            &item,
+        ))
     };
 
     Html(
@@ -1002,17 +1128,17 @@ fn valid_unique_rating_permutation(values: [i16; 5]) -> bool {
     true
 }
 
-fn build_ai_native_info(seed: u64, difficulty: Difficulty, item: &flow::PlanItem) -> AiNativeInfo {
+fn build_ai_native_info(
+    session_uuid: &str,
+    seed: u64,
+    difficulty: Difficulty,
+    item: &flow::PlanItem,
+) -> AiNativeInfo {
     AiNativeInfo {
-        tool_args: format!(
-            "seed={seed} difficulty={difficulty} modality={modality} idx={idx}",
-            seed = seed,
-            difficulty = difficulty.as_str(),
-            modality = item.modality.as_str(),
-            idx = item.scene_index,
-        ),
+        tool_args: format!("session_uuid={session_uuid}"),
         data_url: format!(
-            "/data/{seed}/{difficulty}/{modality}/{idx}",
+            "/data/{session_uuid}/{seed}/{difficulty}/{modality}/{idx}",
+            session_uuid = session_uuid,
             seed = seed,
             difficulty = difficulty.as_str(),
             modality = item.modality.as_str(),
@@ -1034,6 +1160,10 @@ struct SetupPayloadState {
     show_answer_validation: bool,
     identifier: Option<String>,
     session_seed: u64,
+}
+
+fn question_index_i32(item_index: usize) -> Result<i32> {
+    i32::try_from(item_index).context("task index exceeded database limits")
 }
 
 #[cfg(test)]

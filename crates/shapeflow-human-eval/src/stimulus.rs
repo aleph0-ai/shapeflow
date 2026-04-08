@@ -786,8 +786,8 @@ Pair 01-00: relation
             flow::build_scene_for_seed(seed, difficulty, scene_index).expect("scene should build");
         let raw_config =
             flow::build_session_config(seed, difficulty).expect("session config should build");
-        let raw_scene = flow::build_scene_for_index(&raw_config, scene_index)
-            .expect("raw scene should build");
+        let raw_scene =
+            flow::build_scene_for_index(&raw_config, scene_index).expect("raw scene should build");
 
         assert_eq!(mapped_scene, expected_scene);
         assert_ne!(mapped_scene.scene_index, raw_scene.scene_index);

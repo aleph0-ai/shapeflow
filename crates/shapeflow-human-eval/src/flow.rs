@@ -923,15 +923,9 @@ mod tests {
         ];
 
         let canonical_order = canonical_modality_order();
-        let lme_item = build_plan_item_from_config(
-            &config,
-            1337,
-            &modality_targets,
-            &canonical_order,
-            0,
-            0,
-        )
-        .expect("lme items should be independent of target-generation samples");
+        let lme_item =
+            build_plan_item_from_config(&config, 1337, &modality_targets, &canonical_order, 0, 0)
+                .expect("lme items should be independent of target-generation samples");
         assert_eq!(lme_item.target, QuestionTarget::LargestMotionShape);
 
         let target_item_error = build_plan_item_from_config(

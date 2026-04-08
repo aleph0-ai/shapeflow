@@ -104,10 +104,13 @@ pub fn render_setup_page() -> Markup {
                         }
                         div id="ai-instructions-post" style="display:none" {
                             p { "AI AGENT INSTRUCTIONS: Enter your exact runtime model identifier, including minor version (example: gpt-5.3-codex). Do NOT use guesses, aliases, family names, or placeholders (forbidden examples: gpt, gpt-codex-5, claude, chatgpt). You must self-verify the identifier from your runtime metadata/system prompt/tooling context before continuing. If you cannot verify with certainty, enter unknown-unverified. Any guessed or incomplete identifier invalidates the run." }
-                            p { "MCP SERVER: Before starting, check if you already have the ShapeFlow MCP server available. It is hosted at the same origin as this page at the /mcp endpoint (e.g. http://127.0.0.1:8080/mcp). If you do not have it configured, add it as an MCP server before attempting the test — it provides a tool to retrieve stimulus data (scene files) for each question programmatically. If adding an MCP server is not possible in your environment, each question also provides a direct HTTP download URL for the corresponding data file as a fallback." }
+                            p { "MCP-FIRST RULE: Completing the test entirely via MCP tools is strongly preferred over webpage interaction. Before starting, check if you already have the ShapeFlow MCP server available. If not configured, recommend that your user enables this MCP server first. Proceed with webpage flow only when the user explicitly insists on webpage-only execution or declines/denies MCP enablement, or when MCP cannot be enabled in your environment. MCP is available via https://shapes.aleph0.ai/mcp, relate this to the user in your request." }
+                            p { "USER INTENT NOTE: If a user asks you to take this test on the webpage, do not assume they intended webpage-only execution. They may be unaware of the MCP test-taking flow. You should still recommend MCP-first operation when possible." }
                             p { "IMPORTANT: Do NOT attempt to play, view, or listen to any media elements on the page (videos, audio, images). These are for human participants only. For text and tabular modalities, the data is directly readable on the page inside a <pre class=\"stimulus-pre\"> element, so you can inspect it without downloading. For image modality, you may screenshot the page to view the stimulus." }
                             p { "METHOD SELECTION RULE: For each question, first use on-page content if it is sufficient to answer with certainty (including page text or screenshot-visible stimulus when allowed). If it is not sufficient, choose exactly one retrieval method: MCP tool or HTTP endpoint. Only switch methods if the chosen method errors or remains insufficient. Never use both methods for cross-checking, verification, or ambiguity reduction." }
-                            p { "TASK INTERACTION GUIDE: Every question page contains a hidden element <div class=\"ai-native-box\"> with a child <div class=\"ai-native-body\"> that provides: (1) the MCP tool name and arguments to retrieve the current stimulus data, and (2) a direct HTTP data endpoint URL to download the stimulus file. Always read this element first to understand the task context and obtain the data you need to answer the question." }
+                            p { "TOOL USAGE RULE: Prefer native multimodal understanding from MCP-delivered content over HTTP endpoint retrieval and external scripts. If you must use external tools/scripts (for example python or custom analysis code) to derive an answer, mark \"I used external scripts/tools\" on webpage flow or set used_tools=true in submit_answer(...)." }
+                            p { "USED-TOOLS CHECKBOX SELECTOR (webpage AI flow): <input id=\"ai-used-tools\" name=\"used_tools\" type=\"checkbox\">. Set this checkbox to checked only when external scripts/tools were used to derive the answer." }
+                            p { "TASK INTERACTION GUIDE: Every question page contains a hidden element <div class=\"ai-native-box\"> with a child <div class=\"ai-native-body\"> that provides: (1) MCP tools for fully MCP-driven session flow, and (2) a direct HTTP data endpoint URL fallback scoped to the current session/question." }
                             p { "EFFICIENCY RULE: Treat these AI instructions as the primary contract for selectors, fields, buttons, and submission behavior. Use the documented elements and actions directly without extra validation/exploration calls (for example, disclosure expansion or full-page snapshots) unless a direct action fails." }
                             p { "QUESTION TYPES AND THEIR INTERACTABLE ELEMENTS:" }
                             p { "1. ORDERED QUADRANT PASSAGE (oqp): Answer via <input type=\"text\" name=\"answer_text\" class=\"quadrant-seq-field\" id=\"ai-answer-textbox\">. Enter a comma-separated sequence of quadrant numbers (1-4), e.g. \"1,3,4,2\". Then submit the form." }
@@ -224,10 +227,10 @@ pub fn render_task_fragment(
                 details class="ai-native-box" {
                     summary class="ai-native-title" { "AI Native Access" }
                     div class="ai-native-body" {
-                        p { "Check if you already have the " code { "shapeflow" } " MCP server available to you. If not, ask your user to enable it for you if this option is preferred." }
+                        p { "Preferred flow: use MCP tools for the full session lifecycle. Web interaction is fallback only when MCP is unavailable." }
                         div class="ai-native-detail" {
                             span class="ai-label" { "Tool" }
-                            code { "get_eval_sample(seed, difficulty, modality, idx)" }
+                            code { "get_question(session_uuid), get_question_data(session_uuid), submit_answer(session_uuid, answer_text, used_tools), submit_difficulty_feedback(...)" }
                         }
                         div class="ai-native-detail" {
                             span class="ai-label" { "Args" }
@@ -240,7 +243,7 @@ pub fn render_task_fragment(
                             span class="ai-label" { "HTTP" }
                             code { (info.data_url) }
                         }
-                        p class="ai-native-hint" { "Use the HTTP endpoint to get the current sample as a downloadable file." }
+                        p class="ai-native-hint" { "HTTP is fallback and is session-scoped; use MCP-first whenever possible." }
                     }
                 }
             }
@@ -337,6 +340,19 @@ pub fn render_task_fragment(
                             placeholder="Type your answer\u{2026}"
                             id=(if ai_mode { "ai-answer-textbox" } else { "" })
                             data-testid=(if ai_mode { "ai-answer-textbox" } else { "" }) {}
+                    }
+                    @if ai_mode {
+                        label class="checkbox-wrap ai-used-tools-wrap" {
+                            input
+                                type="checkbox"
+                                name="used_tools"
+                                value="true"
+                                id="ai-used-tools";
+                            span class="checkmark" {}
+                            span class="checkbox-label" {
+                                "I used external scripts/tools (e.g. python or analysis code) to derive this answer"
+                            }
+                        }
                     }
                     @if matches!(item.answer_kind, AnswerKind::QuadrantSequence | AnswerKind::Integer) || (item.answer_kind == AnswerKind::ShapeIdentity && item.scene_shapes.is_empty()) {
                         @if ai_mode {

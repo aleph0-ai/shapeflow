@@ -1,6 +1,7 @@
 pub mod db;
 pub mod flow;
 pub mod mcp;
+pub mod mcp_session;
 pub mod server;
 pub mod stimulus;
 pub mod views;
