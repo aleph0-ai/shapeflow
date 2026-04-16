@@ -150,6 +150,7 @@ pub fn render_task_fragment(
     show_answer: bool,
 ) -> Markup {
     let ai_mode = ai_native_info.is_some();
+    let show_skip_modality = !ai_mode && feedback.is_none();
     let local_index = flow::local_item_index(item_index);
     let task_number = flow::task_number(item_index);
 
@@ -194,7 +195,7 @@ pub fn render_task_fragment(
         .unwrap_or(("", ""));
 
     html! {
-        section #task-panel class="task-panel" {
+        section #task-panel class=(if show_skip_modality { "task-panel task-panel-with-skip" } else { "task-panel" }) {
             div class="task-header" {
                 div class="task-header-top" {
                     div class="task-title-row" {
@@ -356,6 +357,19 @@ pub fn render_task_fragment(
                         } @else {
                             button type="submit" class="btn btn-primary" { "Submit Answer" }
                         }
+                    }
+                }
+            }
+
+            @if show_skip_modality {
+                form
+                    method="post"
+                    action="/skip-modality"
+                    data-skip-modality-submit="true"
+                    class="skip-modality-form" {
+                    input type="hidden" name="session_uuid" value=(session_uuid);
+                    button type="submit" class="btn btn-small skip-modality-button" {
+                        "Skip Modality"
                     }
                 }
             }

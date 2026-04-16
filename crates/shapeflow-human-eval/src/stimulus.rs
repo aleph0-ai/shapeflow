@@ -8,7 +8,8 @@ use shapeflow_core::{
     image_encoding::render_scene_image_png_with_scene_config,
     sound_encoding::render_scene_sound_wav,
     tabular_encoding::{
-        generate_tabular_motion_rows, serialize_tabular_motion_rows_csv_display, shape_identity_for_scene,
+        generate_tabular_motion_rows, serialize_tabular_motion_rows_csv_display,
+        shape_identity_for_scene,
     },
     text_encoding::{
         generate_scene_text_lines_with_scene_config_and_profile, serialize_scene_text,
@@ -844,18 +845,15 @@ Pair 01-00: relation
         let seed = 4242;
         let difficulty = Difficulty::Easy;
         let scene_index = 0;
-        let (_config, scene) = build_config_and_scene(seed, difficulty, scene_index)
-            .expect("scene should build");
+        let (_config, scene) =
+            build_config_and_scene(seed, difficulty, scene_index).expect("scene should build");
         assert!(!scene.shape_paths.is_empty());
 
-        let identity = shape_identity_for_scene(&scene, 0).expect("first shape identity should build");
-        let bytes = build_ai_native_sound_reference(
-            seed,
-            difficulty,
-            scene_index,
-            &identity.shape_id,
-        )
-        .expect("sound reference should build");
+        let identity =
+            shape_identity_for_scene(&scene, 0).expect("first shape identity should build");
+        let bytes =
+            build_ai_native_sound_reference(seed, difficulty, scene_index, &identity.shape_id)
+                .expect("sound reference should build");
 
         let reader = hound::WavReader::new(Cursor::new(bytes))
             .expect("sound reference WAV should be parseable");

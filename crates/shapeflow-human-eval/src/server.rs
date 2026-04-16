@@ -72,6 +72,11 @@ struct ProceedPayload {
 }
 
 #[derive(Deserialize)]
+struct SkipModalityPayload {
+    session_uuid: Uuid,
+}
+
+#[derive(Deserialize)]
 struct RatingsPayload {
     session_uuid: Uuid,
     image_difficulty_rating: i16,
@@ -121,6 +126,7 @@ pub async fn run_server(config: HumanEvalServerConfig) -> Result<()> {
         .route("/start/:session_uuid", get(resume_route))
         .route("/events", post(submit_route))
         .route("/proceed", post(proceed_route))
+        .route("/skip-modality", post(skip_modality_route))
         .route("/ratings", post(ratings_route))
         .route("/static/style.css", get(css_route))
         .route("/static/app.js", get(js_route))
@@ -646,6 +652,172 @@ async fn proceed_route(
     )
 }
 
+async fn skip_modality_route(
+    State(state): State<AppState>,
+    Form(payload): Form<SkipModalityPayload>,
+) -> Html<String> {
+    let mut sessions = state.sessions.lock().await;
+    let Some(runtime) = sessions.get_mut(&payload.session_uuid) else {
+        return Html(crate::views::render_error_fragment("session not found").into_string());
+    };
+
+    if runtime.completed {
+        return Html(crate::views::render_completion_fragment().into_string());
+    }
+    if !runtime.is_human {
+        return Html(
+            crate::views::render_error_fragment(
+                "skip modality is available only for human sessions",
+            )
+            .into_string(),
+        );
+    }
+
+    let expected_index = runtime.current_item_index;
+    if expected_index >= flow::total_items() {
+        let session_uuid = payload.session_uuid.to_string();
+        return Html(crate::views::render_ratings_fragment(&session_uuid).into_string());
+    }
+
+    let skipped_indices = skipped_indices_for_modality(expected_index);
+    let next_index = flow::next_modality_start(expected_index);
+
+    if let Some(session_id) = runtime.db_session_id.clone() {
+        let expected_index_i32 = match question_index_i32(expected_index) {
+            Ok(value) => value,
+            Err(error) => {
+                return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            }
+        };
+
+        let db_session = match db::get_session(&state.pool, &session_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return Html(
+                    crate::views::render_error_fragment("session not found").into_string(),
+                );
+            }
+            Err(error) => {
+                return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            }
+        };
+        if db_session.completed {
+            runtime.completed = true;
+            return Html(crate::views::render_completion_fragment().into_string());
+        }
+        if db_session.next_question_index < 0 {
+            return Html(
+                crate::views::render_error_fragment("session progress index is invalid")
+                    .into_string(),
+            );
+        }
+        let db_item_index = match usize::try_from(db_session.next_question_index) {
+            Ok(value) => value,
+            Err(_) => {
+                return Html(
+                    crate::views::render_error_fragment("task index exceeded runtime limits")
+                        .into_string(),
+                );
+            }
+        };
+        if db_item_index >= flow::total_items() {
+            runtime.current_item_index = db_item_index;
+            runtime.awaiting_proceed = false;
+            runtime.cached_task = None;
+            let session_uuid = payload.session_uuid.to_string();
+            return Html(crate::views::render_ratings_fragment(&session_uuid).into_string());
+        }
+        if db_session.next_question_index != expected_index_i32 {
+            return Html(
+                crate::views::render_error_fragment(
+                    "question index does not match server-side progress",
+                )
+                .into_string(),
+            );
+        }
+
+        let skipped_indices_i32 = match skipped_indices
+            .iter()
+            .copied()
+            .map(question_index_i32)
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(values) => values,
+            Err(error) => {
+                return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            }
+        };
+        if let Err(error) =
+            db::append_skipped_questions(&state.pool, &session_id, &skipped_indices_i32).await
+        {
+            return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+        }
+
+        let next_index_i32 = match question_index_i32(next_index) {
+            Ok(value) => value,
+            Err(error) => {
+                return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            }
+        };
+        let updated = match db::advance_session_cursor(
+            &state.pool,
+            &session_id,
+            expected_index_i32,
+            next_index_i32,
+        )
+        .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+            }
+        };
+        runtime.current_item_index = match usize::try_from(updated.next_question_index) {
+            Ok(value) => value,
+            Err(_) => {
+                return Html(
+                    crate::views::render_error_fragment("task index exceeded runtime limits")
+                        .into_string(),
+                );
+            }
+        };
+    } else {
+        runtime.current_item_index = next_index;
+    }
+
+    runtime.awaiting_proceed = false;
+    runtime.cached_task = None;
+
+    let next_index = runtime.current_item_index;
+    if next_index >= flow::total_items() {
+        let session_uuid = payload.session_uuid.to_string();
+        return Html(crate::views::render_ratings_fragment(&session_uuid).into_string());
+    }
+
+    let CachedTaskArtifacts {
+        plan_item: next_plan,
+        stimulus: next_stimulus,
+    } = match cache_or_rebuild_task_artifacts(runtime, next_index) {
+        Ok(value) => value,
+        Err(error) => {
+            return Html(crate::views::render_error_fragment(&error.to_string()).into_string());
+        }
+    };
+
+    Html(
+        crate::views::render_task_fragment(
+            &payload.session_uuid.to_string(),
+            &next_plan,
+            &next_stimulus,
+            next_index,
+            None,
+            None,
+            runtime.show_answer_validation,
+        )
+        .into_string(),
+    )
+}
+
 async fn ratings_route(
     State(state): State<AppState>,
     Form(payload): Form<RatingsPayload>,
@@ -700,7 +872,7 @@ async fn ratings_route(
     )
     .await
     {
-        Ok(()) => {
+        Ok(_) => {
             runtime.completed = true;
             Html(crate::views::render_completion_fragment().into_string())
         }
@@ -841,8 +1013,7 @@ async fn data_route(
             return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     };
-    if let Err(error) =
-        db::append_used_data_route(&state.pool, &session_uuid, question_index).await
+    if let Err(error) = db::append_used_data_route(&state.pool, &session_uuid, question_index).await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
@@ -959,8 +1130,7 @@ async fn sound_reference_route(
             return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     };
-    if let Err(error) =
-        db::append_used_data_route(&state.pool, &session_uuid, question_index).await
+    if let Err(error) = db::append_used_data_route(&state.pool, &session_uuid, question_index).await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
@@ -1299,6 +1469,11 @@ fn question_index_i32(item_index: usize) -> Result<i32> {
     i32::try_from(item_index).context("task index exceeded database limits")
 }
 
+fn skipped_indices_for_modality(item_index: usize) -> Vec<usize> {
+    let (_, block_end) = flow::modality_block_bounds(item_index);
+    (item_index..block_end).collect()
+}
+
 enum ShapeReferenceResolutionError {
     BadRequest(String),
     InternalServer(String),
@@ -1315,28 +1490,30 @@ fn resolve_sound_shape_for_item(
     }
 
     let requested_shape_id = if let Some(raw_shape) = requested_shape {
-        Some(
-            flow::parse_shape_answer(raw_shape).ok_or_else(|| {
-                ShapeReferenceResolutionError::BadRequest(
-                    "shape must be a canonical shape id or natural label (for example red circle)"
-                        .to_string(),
-                )
-            })?,
-        )
+        Some(flow::parse_shape_answer(raw_shape).ok_or_else(|| {
+            ShapeReferenceResolutionError::BadRequest(
+                "shape must be a canonical shape id or natural label (for example red circle)"
+                    .to_string(),
+            )
+        })?)
     } else {
         None
     };
 
     let fallback_shape_id = requested_shape_id
         .or_else(|| item.query_shape.clone())
-        .or_else(|| item.scene_shapes.first().map(|shape| shape.shape_id.clone()));
+        .or_else(|| {
+            item.scene_shapes
+                .first()
+                .map(|shape| shape.shape_id.clone())
+        });
 
     let fallback_shape_id = match fallback_shape_id {
         Some(value) => value,
         None => {
             return Err(ShapeReferenceResolutionError::InternalServer(
                 "current sound question has no selectable shapes".to_string(),
-            ))
+            ));
         }
     };
 
@@ -1380,6 +1557,19 @@ mod tests {
         assert!(!valid_unique_rating_permutation([1, 1, 3, 4, 5]));
         assert!(!valid_unique_rating_permutation([0, 2, 3, 4, 5]));
         assert!(!valid_unique_rating_permutation([1, 2, 3, 4, 6]));
+    }
+
+    #[test]
+    fn skipped_indices_for_modality_match_remaining_block_range() {
+        assert_eq!(skipped_indices_for_modality(3), vec![3, 4, 5, 6]);
+        assert_eq!(
+            flow::next_modality_start(3),
+            flow::SCENES_PER_MODALITY_TOTAL
+        );
+        assert_eq!(
+            skipped_indices_for_modality(flow::total_items() - 1),
+            vec![34]
+        );
     }
 
     #[test]
@@ -1446,7 +1636,6 @@ mod tests {
             difficulty: "easy".to_string(),
             is_human: true,
             show_answer_validation: false,
-            current_item_index: 0,
             next_question_index: 0,
             image_target: "oqp".to_string(),
             video_target: "xct".to_string(),
@@ -1454,6 +1643,7 @@ mod tests {
             tabular_target: "lme".to_string(),
             sound_target: "oqp".to_string(),
             modality_order: "0,1,2,3,4".to_string(),
+            skipped_questions: Vec::new(),
             completed: false,
         };
 

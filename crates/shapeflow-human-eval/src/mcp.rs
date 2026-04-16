@@ -288,38 +288,39 @@ impl HumanEvalMcpServer {
         } else {
             None
         };
-        let (sound_reference_tool, sound_reference_args, sound_reference_url) = if item.modality
-            == flow::Modality::Sound
-        {
-            let sound_shape_id = resolve_sound_shape_for_item(&item, None)?;
-            let sound_reference_url = if item.query_shape.is_some() {
-                format!(
-                    "{}/sound-reference/{}/{}/{}/{}?shape={}",
-                    SHAPES_PUBLIC_BASE_URL,
-                    session_uuid,
-                    state.seed,
-                    state.difficulty.as_str(),
-                    item.scene_index,
-                    sound_shape_id
+        let (sound_reference_tool, sound_reference_args, sound_reference_url) =
+            if item.modality == flow::Modality::Sound {
+                let sound_shape_id = resolve_sound_shape_for_item(&item, None)?;
+                let sound_reference_url = if item.query_shape.is_some() {
+                    format!(
+                        "{}/sound-reference/{}/{}/{}/{}?shape={}",
+                        SHAPES_PUBLIC_BASE_URL,
+                        session_uuid,
+                        state.seed,
+                        state.difficulty.as_str(),
+                        item.scene_index,
+                        sound_shape_id
+                    )
+                } else {
+                    format!(
+                        "{}/sound-reference/{}/{}/{}/{}",
+                        SHAPES_PUBLIC_BASE_URL,
+                        session_uuid,
+                        state.seed,
+                        state.difficulty.as_str(),
+                        item.scene_index
+                    )
+                };
+                (
+                    Some(String::from("get_question_sound_reference")),
+                    Some(format!(
+                        "session_uuid={session_uuid},shape={sound_shape_id}"
+                    )),
+                    Some(sound_reference_url),
                 )
             } else {
-                format!(
-                    "{}/sound-reference/{}/{}/{}/{}",
-                    SHAPES_PUBLIC_BASE_URL,
-                    session_uuid,
-                    state.seed,
-                    state.difficulty.as_str(),
-                    item.scene_index
-                )
+                (None, None, None)
             };
-            (
-                Some(String::from("get_question_sound_reference")),
-                Some(format!("session_uuid={session_uuid},shape={sound_shape_id}")),
-                Some(sound_reference_url),
-            )
-        } else {
-            (None, None, None)
-        };
 
         let payload = QuestionResponse {
             session_uuid: session_uuid.clone(),
@@ -449,8 +450,7 @@ impl HumanEvalMcpServer {
             ));
         }
 
-        let shape_id =
-            resolve_sound_shape_for_item(&item, args.shape.as_deref())?;
+        let shape_id = resolve_sound_shape_for_item(&item, args.shape.as_deref())?;
         let wav = stimulus::build_ai_native_sound_reference(
             state.seed,
             state.difficulty,
@@ -460,11 +460,13 @@ impl HumanEvalMcpServer {
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
         let blob = STANDARD.encode(&wav);
-        let content = vec![RawContent::Audio(RawAudioContent {
-            data: blob,
-            mime_type: "audio/wav".to_string(),
-        })
-        .no_annotation()];
+        let content = vec![
+            RawContent::Audio(RawAudioContent {
+                data: blob,
+                mime_type: "audio/wav".to_string(),
+            })
+            .no_annotation(),
+        ];
         Ok(CallToolResult::success(content))
     }
 
@@ -816,21 +818,23 @@ fn resolve_sound_shape_for_item(
     }
 
     let requested_shape_id = if let Some(raw_shape) = requested_shape {
-        Some(
-            flow::parse_shape_answer(raw_shape).ok_or_else(|| {
-                McpError::invalid_params(
-                    "shape must be a canonical shape id or natural label (for example red circle)",
-                    None,
-                )
-            })?,
-        )
+        Some(flow::parse_shape_answer(raw_shape).ok_or_else(|| {
+            McpError::invalid_params(
+                "shape must be a canonical shape id or natural label (for example red circle)",
+                None,
+            )
+        })?)
     } else {
         None
     };
 
     let fallback_shape_id = requested_shape_id
         .or_else(|| item.query_shape.clone())
-        .or_else(|| item.scene_shapes.first().map(|shape| shape.shape_id.clone()));
+        .or_else(|| {
+            item.scene_shapes
+                .first()
+                .map(|shape| shape.shape_id.clone())
+        });
 
     let fallback_shape_id = fallback_shape_id.ok_or_else(|| {
         McpError::internal_error("current sound question has no selectable shapes", None)

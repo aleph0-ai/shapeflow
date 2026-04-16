@@ -326,6 +326,19 @@ pub fn total_items() -> usize {
     MODALITY_ORDER.len() * SCENES_PER_MODALITY
 }
 
+pub fn modality_block_bounds(item_index: usize) -> (usize, usize) {
+    let block_start = (item_index / SCENES_PER_MODALITY_TOTAL) * SCENES_PER_MODALITY_TOTAL;
+    let block_end = block_start
+        .saturating_add(SCENES_PER_MODALITY_TOTAL)
+        .min(total_items());
+    (block_start.min(total_items()), block_end)
+}
+
+pub fn next_modality_start(item_index: usize) -> usize {
+    let (_, block_end) = modality_block_bounds(item_index);
+    block_end
+}
+
 pub fn scenes_per_modality() -> usize {
     SCENES_PER_MODALITY
 }
@@ -802,10 +815,7 @@ fn build_plan_item_from_config(
                 format!(
                     "Which shape has traveled the longest distance in a single move between two points?{}",
                     if !available_shape_labels.is_empty() {
-                        format!(
-                            " Available options: {}.",
-                            available_shape_labels.join(", ")
-                        )
+                        format!(" Available options: {}.", available_shape_labels.join(", "))
                     } else {
                         String::new()
                     }
@@ -966,15 +976,9 @@ mod tests {
             QuestionTarget::LargestMotionShape,
         ];
         let canonical_order = canonical_modality_order();
-        let item = build_plan_item_from_config(
-            &config,
-            1337,
-            &modality_targets,
-            &canonical_order,
-            0,
-            0,
-        )
-        .expect("lme item should build");
+        let item =
+            build_plan_item_from_config(&config, 1337, &modality_targets, &canonical_order, 0, 0)
+                .expect("lme item should build");
 
         assert_eq!(item.target, QuestionTarget::LargestMotionShape);
         assert_eq!(item.answer_kind, AnswerKind::ShapeIdentity);
@@ -1000,7 +1004,8 @@ mod tests {
             "shape-identity prompt should only use local options suffix"
         );
 
-        let effective_scene_index = effective_scene_index(1337, item.scene_index).expect("mapped scene");
+        let effective_scene_index =
+            effective_scene_index(1337, item.scene_index).expect("mapped scene");
         let scene_layout_seed = config
             .master_seed
             .checked_add(effective_scene_index)
@@ -1027,14 +1032,18 @@ mod tests {
             let dx = event.end_point.x - event.start_point.x;
             let dy = event.end_point.y - event.start_point.y;
             let distance_squared = dx * dx + dy * dy;
-            let rank = ranks.get(event.shape_index).copied().unwrap_or(fallback_rank);
+            let rank = ranks
+                .get(event.shape_index)
+                .copied()
+                .unwrap_or(fallback_rank);
 
             if distance_squared > best_distance_squared + LARGEST_EVENT_DISTANCE_TIE_TOLERANCE {
                 best_distance_squared = distance_squared;
                 winning_rank = rank;
                 continue;
             }
-            if (distance_squared - best_distance_squared).abs() <= LARGEST_EVENT_DISTANCE_TIE_TOLERANCE
+            if (distance_squared - best_distance_squared).abs()
+                <= LARGEST_EVENT_DISTANCE_TIE_TOLERANCE
                 && rank < winning_rank
             {
                 winning_rank = rank;
@@ -1063,7 +1072,10 @@ mod tests {
             .next()
             .expect("winner should resolve");
 
-        assert_eq!(item.expected_answer, ExpectedAnswer::ShapeId(expected_shape_id));
+        assert_eq!(
+            item.expected_answer,
+            ExpectedAnswer::ShapeId(expected_shape_id)
+        );
 
         let non_lme_item = build_plan_item_from_config(
             &config,
@@ -1167,6 +1179,37 @@ mod tests {
             seen[index] = true;
         }
         assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn next_modality_start_advances_to_next_block_boundary() {
+        assert_eq!(next_modality_start(0), SCENES_PER_MODALITY_TOTAL);
+        assert_eq!(
+            next_modality_start(SCENES_PER_MODALITY_TOTAL - 1),
+            SCENES_PER_MODALITY_TOTAL
+        );
+        assert_eq!(
+            next_modality_start(SCENES_PER_MODALITY_TOTAL),
+            SCENES_PER_MODALITY_TOTAL * 2
+        );
+        assert_eq!(next_modality_start(total_items() - 1), total_items());
+        assert_eq!(next_modality_start(total_items()), total_items());
+    }
+
+    #[test]
+    fn modality_block_bounds_tracks_current_modality_span() {
+        assert_eq!(
+            modality_block_bounds(SCENES_PER_MODALITY_TOTAL + 2),
+            (SCENES_PER_MODALITY_TOTAL, SCENES_PER_MODALITY_TOTAL * 2)
+        );
+        assert_eq!(
+            modality_block_bounds(total_items() - 1),
+            (total_items() - SCENES_PER_MODALITY_TOTAL, total_items())
+        );
+        assert_eq!(
+            modality_block_bounds(total_items()),
+            (total_items(), total_items())
+        );
     }
 
     #[test]

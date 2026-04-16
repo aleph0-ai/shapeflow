@@ -6,6 +6,7 @@ function swapTaskPanel(content) {
 function wireInteractiveUi(root) {
     wireAnswerSubmit(root);
     wireProceedSubmit(root);
+    wireSkipModalitySubmit(root);
     wireRatingsSubmit(root);
     wireVideoPlayers(root);
     wireAudioPreviewButtons(root);
@@ -280,6 +281,24 @@ function wireProceedSubmit(root) {
         event.preventDefault();
         var body = new URLSearchParams(new FormData(form));
         var response = await fetch(form.getAttribute("action") || "/proceed", {
+            method: "POST",
+            headers: { "Accept": "text/html" },
+            body: body
+        });
+        var content = await response.text();
+        swapTaskPanel(content);
+        wireInteractiveUi(document);
+    });
+}
+
+function wireSkipModalitySubmit(root) {
+    var form = root.querySelector('form[data-skip-modality-submit="true"]');
+    if (!form || form.dataset.bound === "1") return;
+    form.dataset.bound = "1";
+    form.addEventListener("submit", async function (event) {
+        event.preventDefault();
+        var body = new URLSearchParams(new FormData(form));
+        var response = await fetch(form.getAttribute("action") || "/skip-modality", {
             method: "POST",
             headers: { "Accept": "text/html" },
             body: body

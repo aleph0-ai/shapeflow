@@ -18,7 +18,6 @@ pub struct SessionRecord {
     pub difficulty: String,
     pub is_human: bool,
     pub show_answer_validation: bool,
-    pub current_item_index: i32,
     pub next_question_index: i32,
     pub image_target: String,
     pub video_target: String,
@@ -26,6 +25,7 @@ pub struct SessionRecord {
     pub tabular_target: String,
     pub sound_target: String,
     pub modality_order: String,
+    pub skipped_questions: Vec<i32>,
     pub completed: bool,
 }
 
@@ -92,7 +92,6 @@ pub async fn create_session(
             is_human,
             show_answer_validation,
             identifier,
-            current_item_index,
             next_question_index,
             image_target,
             video_target,
@@ -100,14 +99,13 @@ pub async fn create_session(
             tabular_target,
             sound_target,
             modality_order
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         RETURNING
             session_id,
             seed,
             difficulty,
             is_human,
             show_answer_validation,
-            current_item_index,
             next_question_index,
             image_target,
             video_target,
@@ -115,6 +113,7 @@ pub async fn create_session(
             tabular_target,
             sound_target,
             modality_order,
+            skipped_questions,
             completed"#
     } else {
         r#"INSERT INTO human_eval_sessions (
@@ -124,7 +123,6 @@ pub async fn create_session(
             is_human,
             show_answer_validation,
             identifier,
-            current_item_index,
             next_question_index,
             image_target,
             video_target,
@@ -132,14 +130,13 @@ pub async fn create_session(
             tabular_target,
             sound_target,
             modality_order
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         RETURNING
             session_id,
             seed,
             difficulty,
             is_human,
             show_answer_validation,
-            current_item_index,
             next_question_index,
             image_target,
             video_target,
@@ -147,6 +144,7 @@ pub async fn create_session(
             tabular_target,
             sound_target,
             modality_order,
+            skipped_questions,
             completed"#
     };
 
@@ -159,7 +157,6 @@ pub async fn create_session(
                 .bind(is_human)
                 .bind(show_answer_validation)
                 .bind(identifier)
-                .bind(initial_item_index)
                 .bind(initial_item_index)
                 .bind(modality_targets[0].as_str())
                 .bind(modality_targets[1].as_str())
@@ -180,7 +177,6 @@ pub async fn create_session(
                 .bind(is_human)
                 .bind(show_answer_validation)
                 .bind(identifier)
-                .bind(initial_item_index)
                 .bind(initial_item_index)
                 .bind(modality_targets[0].as_str())
                 .bind(modality_targets[1].as_str())
@@ -204,7 +200,6 @@ pub async fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<Sessi
             difficulty,
             is_human,
             show_answer_validation,
-            current_item_index,
             next_question_index,
             image_target,
             video_target,
@@ -212,6 +207,7 @@ pub async fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<Sessi
             tabular_target,
             sound_target,
             modality_order,
+            skipped_questions,
             completed
         FROM human_eval_sessions
         WHERE session_id = $1"#
@@ -222,7 +218,6 @@ pub async fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<Sessi
             difficulty,
             is_human,
             show_answer_validation,
-            current_item_index,
             next_question_index,
             image_target,
             video_target,
@@ -230,6 +225,7 @@ pub async fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<Sessi
             tabular_target,
             sound_target,
             modality_order,
+            skipped_questions,
             completed
         FROM human_eval_sessions
         WHERE session_id = ?1"#
@@ -299,7 +295,6 @@ pub async fn record_answer(
     let query = format!(
         "UPDATE human_eval_sessions
             SET
-                current_item_index = {p1},
                 next_question_index = {p1},
                 {correct_field} = {correct_field} + {p2},
                 {wrong_field} = {wrong_field} + {p3},
@@ -313,7 +308,6 @@ pub async fn record_answer(
                 difficulty,
                 is_human,
                 show_answer_validation,
-                current_item_index,
                 next_question_index,
                 image_target,
                 video_target,
@@ -321,6 +315,7 @@ pub async fn record_answer(
                 tabular_target,
                 sound_target,
                 modality_order,
+                skipped_questions,
                 completed"
     );
 
@@ -352,6 +347,64 @@ pub async fn record_answer(
     }
 }
 
+pub async fn advance_session_cursor(
+    pool: &DbPool,
+    session_id: &str,
+    expected_item_index: i32,
+    next_item_index: i32,
+) -> Result<SessionRecord> {
+    let now_expr = now_expr(pool);
+    let p1 = placeholder(pool, 1);
+    let p2 = placeholder(pool, 2);
+    let p3 = placeholder(pool, 3);
+    let query = format!(
+        "UPDATE human_eval_sessions
+            SET next_question_index = {p1},
+                updated_at = {now_expr}
+          WHERE session_id = {p2}
+            AND completed = FALSE
+            AND next_question_index = {p3}
+          RETURNING
+              session_id,
+              seed,
+              difficulty,
+              is_human,
+              show_answer_validation,
+              next_question_index,
+              image_target,
+              video_target,
+              text_target,
+              tabular_target,
+              sound_target,
+              modality_order,
+              skipped_questions,
+              completed"
+    );
+
+    match pool {
+        DbPool::Postgres(pg) => {
+            let row = sqlx::query(&query)
+                .bind(next_item_index)
+                .bind(session_id)
+                .bind(expected_item_index)
+                .fetch_one(pg)
+                .await
+                .context("failed to advance session cursor")?;
+            decode_session_row_pg(&row)
+        }
+        DbPool::Sqlite(sqlite) => {
+            let row = sqlx::query(&query)
+                .bind(next_item_index)
+                .bind(session_id)
+                .bind(expected_item_index)
+                .fetch_one(sqlite)
+                .await
+                .context("failed to advance session cursor")?;
+            decode_session_row_sqlite(&row)
+        }
+    }
+}
+
 pub async fn store_ratings(
     pool: &DbPool,
     session_id: &str,
@@ -360,7 +413,7 @@ pub async fn store_ratings(
     text_rating: i16,
     tabular_rating: i16,
     sound_rating: i16,
-) -> Result<()> {
+) -> Result<SessionRecord> {
     let now_expr = now_expr(pool);
     let p1 = placeholder(pool, 1);
     let p2 = placeholder(pool, 2);
@@ -379,69 +432,52 @@ pub async fn store_ratings(
                 completed = TRUE,
                 updated_at = {now_expr}
             WHERE session_id = {p6}
-              AND completed = FALSE"
+              AND completed = FALSE
+            RETURNING
+                session_id,
+                seed,
+                difficulty,
+                is_human,
+                show_answer_validation,
+                next_question_index,
+                image_target,
+                video_target,
+                text_target,
+                tabular_target,
+                sound_target,
+                modality_order,
+                skipped_questions,
+                completed"
     );
 
     match pool {
         DbPool::Postgres(pg) => {
-            let mut tx = pg
-                .begin()
-                .await
-                .context("failed to begin ratings transaction")?;
-
-            let update = sqlx::query(&query)
+            let row = sqlx::query(&query)
                 .bind(image_rating)
                 .bind(video_rating)
                 .bind(text_rating)
                 .bind(tabular_rating)
                 .bind(sound_rating)
                 .bind(session_id)
-                .execute(&mut *tx)
+                .fetch_one(pg)
                 .await
                 .context("failed to write session ratings")?;
-
-            if update.rows_affected() != 1 {
-                tx.rollback()
-                    .await
-                    .context("failed to rollback ratings update")?;
-                anyhow::bail!("session {session_id} was already completed or does not exist");
-            }
-
-            tx.commit()
-                .await
-                .context("failed to commit ratings update")?;
+            decode_session_row_pg(&row)
         }
         DbPool::Sqlite(sqlite) => {
-            let mut tx = sqlite
-                .begin()
-                .await
-                .context("failed to begin ratings transaction")?;
-
-            let update = sqlx::query(&query)
+            let row = sqlx::query(&query)
                 .bind(image_rating)
                 .bind(video_rating)
                 .bind(text_rating)
                 .bind(tabular_rating)
                 .bind(sound_rating)
                 .bind(session_id)
-                .execute(&mut *tx)
+                .fetch_one(sqlite)
                 .await
                 .context("failed to write session ratings")?;
-
-            if update.rows_affected() != 1 {
-                tx.rollback()
-                    .await
-                    .context("failed to rollback ratings update")?;
-                anyhow::bail!("session {session_id} was already completed or does not exist");
-            }
-
-            tx.commit()
-                .await
-                .context("failed to commit ratings update")?;
+            decode_session_row_sqlite(&row)
         }
     }
-
-    Ok(())
 }
 
 pub async fn append_used_tools(
@@ -449,7 +485,7 @@ pub async fn append_used_tools(
     session_id: &str,
     question_number: i32,
 ) -> Result<()> {
-    append_usage_marker(pool, session_id, "used_tools", question_number).await
+    append_usage_markers(pool, session_id, "used_tools", &[question_number]).await
 }
 
 pub async fn append_used_data_mcp(
@@ -457,7 +493,7 @@ pub async fn append_used_data_mcp(
     session_id: &str,
     question_number: i32,
 ) -> Result<()> {
-    append_usage_marker(pool, session_id, "used_data_mcp", question_number).await
+    append_usage_markers(pool, session_id, "used_data_mcp", &[question_number]).await
 }
 
 pub async fn append_used_data_route(
@@ -465,7 +501,23 @@ pub async fn append_used_data_route(
     session_id: &str,
     question_number: i32,
 ) -> Result<()> {
-    append_usage_marker(pool, session_id, "used_data_route", question_number).await
+    append_usage_markers(pool, session_id, "used_data_route", &[question_number]).await
+}
+
+pub async fn append_skipped_question(
+    pool: &DbPool,
+    session_id: &str,
+    question_number: i32,
+) -> Result<()> {
+    append_usage_markers(pool, session_id, "skipped_questions", &[question_number]).await
+}
+
+pub async fn append_skipped_questions(
+    pool: &DbPool,
+    session_id: &str,
+    question_numbers: &[i32],
+) -> Result<()> {
+    append_usage_markers(pool, session_id, "skipped_questions", question_numbers).await
 }
 
 pub fn parse_difficulty(value: &str) -> Result<Difficulty> {
@@ -479,7 +531,6 @@ fn decode_session_row_pg(row: &sqlx::postgres::PgRow) -> Result<SessionRecord> {
         difficulty: row.try_get("difficulty")?,
         is_human: row.try_get("is_human")?,
         show_answer_validation: row.try_get("show_answer_validation")?,
-        current_item_index: row.try_get("current_item_index")?,
         next_question_index: row.try_get("next_question_index")?,
         image_target: row.try_get("image_target")?,
         video_target: row.try_get("video_target")?,
@@ -487,18 +538,19 @@ fn decode_session_row_pg(row: &sqlx::postgres::PgRow) -> Result<SessionRecord> {
         tabular_target: row.try_get("tabular_target")?,
         sound_target: row.try_get("sound_target")?,
         modality_order: row.try_get("modality_order")?,
+        skipped_questions: row.try_get("skipped_questions")?,
         completed: row.try_get("completed")?,
     })
 }
 
 fn decode_session_row_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {
+    let skipped_questions = decode_sqlite_integer_array(row, "skipped_questions")?;
     Ok(SessionRecord {
         session_id: row.try_get("session_id")?,
         seed: row.try_get("seed")?,
         difficulty: row.try_get("difficulty")?,
         is_human: row.try_get("is_human")?,
         show_answer_validation: row.try_get("show_answer_validation")?,
-        current_item_index: row.try_get("current_item_index")?,
         next_question_index: row.try_get("next_question_index")?,
         image_target: row.try_get("image_target")?,
         video_target: row.try_get("video_target")?,
@@ -506,8 +558,20 @@ fn decode_session_row_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<SessionRec
         tabular_target: row.try_get("tabular_target")?,
         sound_target: row.try_get("sound_target")?,
         modality_order: row.try_get("modality_order")?,
+        skipped_questions,
         completed: row.try_get("completed")?,
     })
+}
+
+fn decode_sqlite_integer_array(
+    row: &sqlx::sqlite::SqliteRow,
+    column_name: &str,
+) -> Result<Vec<i32>> {
+    let raw_json: String = row
+        .try_get(column_name)
+        .with_context(|| format!("failed to decode {column_name} as text"))?;
+    serde_json::from_str(&raw_json)
+        .with_context(|| format!("failed to parse {column_name} json array"))
 }
 
 fn sqlite_url_from_path(path: &str) -> String {
@@ -540,12 +604,16 @@ fn placeholder(pool: &DbPool, index: usize) -> String {
     }
 }
 
-async fn append_usage_marker(
+async fn append_usage_markers(
     pool: &DbPool,
     session_id: &str,
     column_name: &str,
-    question_number: i32,
+    question_numbers: &[i32],
 ) -> Result<()> {
+    if question_numbers.is_empty() {
+        return Ok(());
+    }
+
     match pool {
         DbPool::Postgres(pg) => {
             let mut tx = pg
@@ -571,8 +639,10 @@ async fn append_usage_marker(
             let mut values: Vec<i32> = row
                 .try_get(column_name)
                 .with_context(|| format!("failed to decode {column_name} as integer array"))?;
-            if !values.contains(&question_number) {
-                values.push(question_number);
+            for &question_number in question_numbers {
+                if !values.contains(&question_number) {
+                    values.push(question_number);
+                }
             }
 
             let update_sql = format!(
@@ -612,13 +682,11 @@ async fn append_usage_marker(
                 anyhow::bail!("session {session_id} not found");
             };
 
-            let raw_json: String = row
-                .try_get(column_name)
-                .with_context(|| format!("failed to decode {column_name} as text"))?;
-            let mut values: Vec<i32> = serde_json::from_str(&raw_json)
-                .with_context(|| format!("failed to parse {column_name} json array"))?;
-            if !values.contains(&question_number) {
-                values.push(question_number);
+            let mut values = decode_sqlite_integer_array(&row, column_name)?;
+            for &question_number in question_numbers {
+                if !values.contains(&question_number) {
+                    values.push(question_number);
+                }
             }
             let next_json =
                 serde_json::to_string(&values).context("failed to serialize usage marker array")?;
@@ -801,7 +869,7 @@ mod tests {
 
         let targets = [QuestionTarget::OrderedQuadrantPassage; 5];
         let order = canonical_modality_order();
-        create_session(
+        let created = create_session(
             &pool,
             "session-usage",
             321,
@@ -815,6 +883,10 @@ mod tests {
         )
         .await
         .expect("create session");
+        assert!(
+            created.skipped_questions.is_empty(),
+            "new sessions should default skipped_questions to []"
+        );
 
         append_used_tools(&pool, "session-usage", 0)
             .await
@@ -884,6 +956,11 @@ mod tests {
         assert!(column_names.iter().any(|name| name == "used_tools"));
         assert!(column_names.iter().any(|name| name == "used_data_mcp"));
         assert!(column_names.iter().any(|name| name == "used_data_route"));
+        assert!(column_names.iter().any(|name| name == "skipped_questions"));
+        assert!(
+            !column_names.iter().any(|name| name == "current_item_index"),
+            "current_item_index column should be dropped"
+        );
 
         let indexes = sqlx::query("PRAGMA index_list('human_eval_sessions')")
             .fetch_all(sqlite)
@@ -894,9 +971,16 @@ mod tests {
             .map(|row| row.try_get("name").expect("index name"))
             .collect();
         assert!(
-            index_names
+            !index_names
                 .iter()
-                .any(|name| name == "idx_human_eval_sessions_active_progress")
+                .any(|name| name == "idx_human_eval_sessions_active_progress"),
+            "current_item_index index should be dropped"
+        );
+        assert!(
+            !index_names
+                .iter()
+                .any(|name| name == "idx_human_eval_sessions_progress"),
+            "legacy current_item_index index should be dropped"
         );
         assert!(
             index_names
@@ -907,6 +991,61 @@ mod tests {
             index_names
                 .iter()
                 .any(|name| name == "idx_human_eval_sessions_active_next_progress")
+        );
+    }
+
+    #[tokio::test]
+    async fn append_skipped_questions_deduplicates_in_sqlite() {
+        let pool = connect_pool(&HumanEvalDatabaseConfig::SqlitePath(":memory:".to_string()))
+            .await
+            .expect("sqlite pool");
+        ensure_schema(&pool).await.expect("schema");
+
+        let targets = [QuestionTarget::OrderedQuadrantPassage; 5];
+        let order = canonical_modality_order();
+        create_session(
+            &pool,
+            "session-skip",
+            911,
+            Difficulty::Medium,
+            true,
+            false,
+            None,
+            0,
+            &targets,
+            &order,
+        )
+        .await
+        .expect("create session");
+
+        append_skipped_question(&pool, "session-skip", 2)
+            .await
+            .expect("append skipped question");
+        append_skipped_question(&pool, "session-skip", 2)
+            .await
+            .expect("append duplicate skipped question");
+        append_skipped_questions(&pool, "session-skip", &[2, 3, 4, 3])
+            .await
+            .expect("append skipped question batch");
+
+        let DbPool::Sqlite(sqlite) = &pool else {
+            panic!("expected sqlite pool");
+        };
+        let row = sqlx::query(
+            "SELECT skipped_questions
+             FROM human_eval_sessions
+             WHERE session_id = ?1",
+        )
+        .bind("session-skip")
+        .fetch_one(sqlite)
+        .await
+        .expect("select skipped questions");
+        let skipped_questions: String = row
+            .try_get("skipped_questions")
+            .expect("skipped_questions text");
+        assert_eq!(
+            serde_json::from_str::<Vec<i32>>(&skipped_questions).expect("decode skipped_questions"),
+            vec![2, 3, 4]
         );
     }
 
