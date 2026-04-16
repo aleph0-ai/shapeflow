@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "shapeflow-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "camino",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "shapeflow-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "ciborium",
  "hex",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "shapeflow-human-eval"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2459,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "shapeflow-py"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "pyo3",
  "serde",

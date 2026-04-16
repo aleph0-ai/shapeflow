@@ -658,6 +658,21 @@ fn build_plan_item_from_config(
 
     let build_task_id = |prefix: &str| format!("{prefix}{query_shape_index:04}");
 
+    let scene_shapes = (0..shape_count)
+        .filter_map(|i| {
+            shape_identity_for_scene_seed(scene_layout_seed, shape_identity_assignment, i)
+                .ok()
+                .map(|id| ShapeChoice {
+                    label: shape_id_to_natural_label(&id.shape_id),
+                    shape_id: id.shape_id,
+                })
+        })
+        .collect::<Vec<_>>();
+    let available_shape_labels = scene_shapes
+        .iter()
+        .map(|choice| choice.label.clone())
+        .collect::<Vec<_>>();
+
     let (prompt, answer_kind, answer_hint, expected_answer, query_shape) = match target {
         QuestionTarget::OrderedQuadrantPassage => {
             let target_by_id = target_by_id.as_ref().ok_or_else(|| {
@@ -784,8 +799,16 @@ fn build_plan_item_from_config(
             let winning_shape_id =
                 winning_shape_id.ok_or(FlowError::LargestShapeTargetResolution)?;
             (
-                String::from(
-                    "Which shape has traveled the longest distance in a single move between two points?",
+                format!(
+                    "Which shape has traveled the longest distance in a single move between two points?{}",
+                    if !available_shape_labels.is_empty() {
+                        format!(
+                            " Available options: {}.",
+                            available_shape_labels.join(", ")
+                        )
+                    } else {
+                        String::new()
+                    }
                 ),
                 AnswerKind::ShapeIdentity,
                 String::from("Enter shape and color (e.g. red circle)"),
@@ -794,17 +817,6 @@ fn build_plan_item_from_config(
             )
         }
     };
-
-    let scene_shapes = (0..shape_count)
-        .filter_map(|i| {
-            shape_identity_for_scene_seed(scene_layout_seed, shape_identity_assignment, i)
-                .ok()
-                .map(|id| ShapeChoice {
-                    label: shape_id_to_natural_label(&id.shape_id),
-                    shape_id: id.shape_id,
-                })
-        })
-        .collect();
 
     Ok(PlanItem {
         item_index,
@@ -940,6 +952,131 @@ mod tests {
         assert!(
             matches!(target_item_error, FlowError::CoreGeneration(_)),
             "expected core-generation failure when samples_per_event is zero"
+        );
+    }
+
+    #[test]
+    fn largest_motion_shape_prompt_includes_options_and_preserves_expected_answer() {
+        let config = build_session_config(1337, Difficulty::Easy).expect("config should be valid");
+        let modality_targets = [
+            QuestionTarget::LargestMotionShape,
+            QuestionTarget::OrderedQuadrantPassage,
+            QuestionTarget::LargestMotionShape,
+            QuestionTarget::LargestMotionShape,
+            QuestionTarget::LargestMotionShape,
+        ];
+        let canonical_order = canonical_modality_order();
+        let item = build_plan_item_from_config(
+            &config,
+            1337,
+            &modality_targets,
+            &canonical_order,
+            0,
+            0,
+        )
+        .expect("lme item should build");
+
+        assert_eq!(item.target, QuestionTarget::LargestMotionShape);
+        assert_eq!(item.answer_kind, AnswerKind::ShapeIdentity);
+
+        let expected_options = item
+            .scene_shapes
+            .iter()
+            .map(|shape| shape.label.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let expected_suffix = if expected_options.is_empty() {
+            String::new()
+        } else {
+            format!(" Available options: {}.", expected_options)
+        };
+        let expected_prompt = format!(
+            "Which shape has traveled the longest distance in a single move between two points?{}",
+            expected_suffix
+        );
+        assert_eq!(item.prompt, expected_prompt);
+        assert!(
+            !item.prompt.contains("Available shapes in this scene:"),
+            "shape-identity prompt should only use local options suffix"
+        );
+
+        let effective_scene_index = effective_scene_index(1337, item.scene_index).expect("mapped scene");
+        let scene_layout_seed = config
+            .master_seed
+            .checked_add(effective_scene_index)
+            .expect("effective scene layout seed should fit in u64");
+        let scene = build_scene_for_absolute_index(&config, effective_scene_index)
+            .expect("scene should build");
+        let shape_count = usize::from(config.scene.n_shapes);
+        let mut ranks = Vec::with_capacity(shape_count);
+        for shape_index in 0..shape_count {
+            ranks.push(
+                canonical_class_rank_for_scene_seed(
+                    scene_layout_seed,
+                    config.scene.shape_identity_assignment,
+                    shape_index,
+                )
+                .expect("canonical rank should resolve"),
+            );
+        }
+
+        let fallback_rank = ranks.iter().copied().min().unwrap_or(0u8);
+        let mut best_distance_squared = -1.0_f64;
+        let mut winning_rank = fallback_rank;
+        for event in &scene.motion_events {
+            let dx = event.end_point.x - event.start_point.x;
+            let dy = event.end_point.y - event.start_point.y;
+            let distance_squared = dx * dx + dy * dy;
+            let rank = ranks.get(event.shape_index).copied().unwrap_or(fallback_rank);
+
+            if distance_squared > best_distance_squared + LARGEST_EVENT_DISTANCE_TIE_TOLERANCE {
+                best_distance_squared = distance_squared;
+                winning_rank = rank;
+                continue;
+            }
+            if (distance_squared - best_distance_squared).abs() <= LARGEST_EVENT_DISTANCE_TIE_TOLERANCE
+                && rank < winning_rank
+            {
+                winning_rank = rank;
+            }
+        }
+
+        let expected_shape_id = (0..shape_count)
+            .filter_map(|shape_index| {
+                canonical_class_rank_for_scene_seed(
+                    scene_layout_seed,
+                    config.scene.shape_identity_assignment,
+                    shape_index,
+                )
+                .ok()
+                .filter(|&rank| rank == winning_rank)
+                .and_then(|_| {
+                    shape_identity_for_scene_seed(
+                        scene_layout_seed,
+                        config.scene.shape_identity_assignment,
+                        shape_index,
+                    )
+                    .ok()
+                    .map(|identity| identity.shape_id)
+                })
+            })
+            .next()
+            .expect("winner should resolve");
+
+        assert_eq!(item.expected_answer, ExpectedAnswer::ShapeId(expected_shape_id));
+
+        let non_lme_item = build_plan_item_from_config(
+            &config,
+            1337,
+            &modality_targets,
+            &canonical_order,
+            SCENES_PER_MODALITY,
+            24,
+        )
+        .expect("non-lme item should build");
+        assert!(
+            !non_lme_item.prompt.contains("Available options:"),
+            "non-shape-identity prompts should remain unchanged"
         );
     }
 

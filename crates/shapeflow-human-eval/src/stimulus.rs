@@ -8,8 +8,7 @@ use shapeflow_core::{
     image_encoding::render_scene_image_png_with_scene_config,
     sound_encoding::render_scene_sound_wav,
     tabular_encoding::{
-        generate_tabular_motion_rows, serialize_tabular_motion_rows_csv,
-        serialize_tabular_motion_rows_csv_display, shape_identity_for_scene,
+        generate_tabular_motion_rows, serialize_tabular_motion_rows_csv_display, shape_identity_for_scene,
     },
     text_encoding::{
         generate_scene_text_lines_with_scene_config_and_profile, serialize_scene_text,
@@ -255,7 +254,7 @@ pub fn build_ai_native_sample(
                 .context("failed to render native tabular sample rows")?;
             Ok(NativeSamplePayload::Text {
                 mime_type: "text/csv; charset=utf-8".to_string(),
-                text: serialize_tabular_motion_rows_csv(&rows),
+                text: serialize_tabular_motion_rows_csv_display(&rows),
             })
         }
         Modality::Sound => {
@@ -274,6 +273,35 @@ pub fn build_ai_native_sample(
             })
         }
     }
+}
+
+pub fn build_ai_native_sound_reference(
+    seed: u64,
+    difficulty: Difficulty,
+    scene_index: u32,
+    shape_id: &str,
+) -> Result<Vec<u8>> {
+    let (config, scene) = build_config_and_scene(seed, difficulty, scene_index)
+        .context("failed to build sound reference inputs")?;
+
+    let shape_index = (0..scene.shape_paths.len())
+        .find(|&shape_index| {
+            shape_identity_for_scene(&scene, shape_index)
+                .ok()
+                .is_some_and(|identity| identity.shape_id == shape_id)
+        })
+        .ok_or_else(|| anyhow::anyhow!("shape id '{shape_id}' is not present in this scene"))?;
+
+    let wav = render_preview_motion_wav(
+        &scene,
+        &config,
+        shape_index,
+        (0.0, 0.0),
+        (0.0, 0.0),
+        EasingFamily::Linear,
+    )
+    .context("failed to render sound reference preview")?;
+    normalize_preview_wav_peak(&wav).context("failed to normalize sound reference WAV")
 }
 
 fn build_config_and_scene(
@@ -791,5 +819,58 @@ Pair 01-00: relation
 
         assert_eq!(mapped_scene, expected_scene);
         assert_ne!(mapped_scene.scene_index, raw_scene.scene_index);
+    }
+
+    #[test]
+    fn build_ai_native_sample_tabular_uses_display_schema() {
+        let payload = build_ai_native_sample(42, Difficulty::Medium, Modality::Tabular, 3)
+            .expect("tabular sample should build");
+
+        let NativeSamplePayload::Text { text, .. } = payload else {
+            panic!("tabular native sample should be text payload");
+        };
+
+        let header = text
+            .lines()
+            .next()
+            .expect("tabular CSV should contain a header row");
+
+        assert!(!header.contains("scene_id"));
+        assert!(header.contains("event_index"));
+    }
+
+    #[test]
+    fn build_ai_native_sound_reference_renders_shape_clip() {
+        let seed = 4242;
+        let difficulty = Difficulty::Easy;
+        let scene_index = 0;
+        let (_config, scene) = build_config_and_scene(seed, difficulty, scene_index)
+            .expect("scene should build");
+        assert!(!scene.shape_paths.is_empty());
+
+        let identity = shape_identity_for_scene(&scene, 0).expect("first shape identity should build");
+        let bytes = build_ai_native_sound_reference(
+            seed,
+            difficulty,
+            scene_index,
+            &identity.shape_id,
+        )
+        .expect("sound reference should build");
+
+        let reader = hound::WavReader::new(Cursor::new(bytes))
+            .expect("sound reference WAV should be parseable");
+        assert_eq!(reader.spec().channels, 2);
+        assert_eq!(reader.spec().sample_format, hound::SampleFormat::Int);
+    }
+
+    #[test]
+    fn build_ai_native_sound_reference_rejects_unknown_shape() {
+        let seed = 4242;
+        let difficulty = Difficulty::Easy;
+        let scene_index = 0;
+
+        let err = build_ai_native_sound_reference(seed, difficulty, scene_index, "not_a_shape")
+            .expect_err("unknown shape id should fail");
+        assert!(err.to_string().contains("is not present in this scene"));
     }
 }

@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
-    extract::{Form, Json, Path, State},
+    extract::{Form, Json, Path, Query, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -81,6 +81,11 @@ struct RatingsPayload {
     sound_difficulty_rating: i16,
 }
 
+#[derive(Deserialize)]
+struct SoundReferenceQuery {
+    shape: Option<String>,
+}
+
 pub async fn run_server(config: HumanEvalServerConfig) -> Result<()> {
     let pool = db::connect_pool(&config.database)
         .await
@@ -120,6 +125,10 @@ pub async fn run_server(config: HumanEvalServerConfig) -> Result<()> {
         .route("/static/style.css", get(css_route))
         .route("/static/app.js", get(js_route))
         .route("/static/shapeflow.svg", get(logo_route))
+        .route(
+            "/sound-reference/:session_uuid/:seed/:difficulty/:index",
+            get(sound_reference_route),
+        )
         .route(
             "/data/:session_uuid/:seed/:difficulty/:modality/:index",
             get(data_route),
@@ -860,6 +869,130 @@ async fn data_route(
     }
 }
 
+async fn sound_reference_route(
+    State(state): State<AppState>,
+    Path((session_uuid, seed, difficulty, index)): Path<(String, u64, String, u32)>,
+    Query(query): Query<SoundReferenceQuery>,
+) -> Response {
+    let requested_difficulty = match Difficulty::from_str(&difficulty) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+    };
+
+    let session = match db::get_session(&state.pool, &session_uuid).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return (StatusCode::NOT_FOUND, "session not found").into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    if session.completed {
+        return (StatusCode::FORBIDDEN, "session is already completed").into_response();
+    }
+    if session.next_question_index < 0 {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session progress index is invalid",
+        )
+            .into_response();
+    }
+
+    let item_index = session.next_question_index as usize;
+    if item_index >= flow::total_items() {
+        return (StatusCode::FORBIDDEN, "all questions are complete").into_response();
+    }
+
+    let session_seed = match u64::try_from(session.seed) {
+        Ok(value) => value,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "session seed is invalid").into_response();
+        }
+    };
+    let session_difficulty = match db::parse_difficulty(&session.difficulty) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let modality_targets = match parse_modality_targets_from_record(&session) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let modality_order = match parse_modality_order_from_record(&session) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let current_item = match flow::build_plan_item_with_modality_order(
+        session_seed,
+        session_difficulty,
+        &modality_targets,
+        &modality_order,
+        item_index,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    if seed != session_seed
+        || requested_difficulty != session_difficulty
+        || index != current_item.scene_index
+        || current_item.modality != flow::Modality::Sound
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "requested data does not match the session's current question",
+        )
+            .into_response();
+    }
+
+    let question_index = match question_index_i32(item_index) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    if let Err(error) =
+        db::append_used_data_route(&state.pool, &session_uuid, question_index).await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+
+    let shape_id = match resolve_sound_shape_for_item(&current_item, query.shape.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            return match error {
+                ShapeReferenceResolutionError::BadRequest(message) => {
+                    (StatusCode::BAD_REQUEST, message).into_response()
+                }
+                ShapeReferenceResolutionError::InternalServer(message) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+                }
+            };
+        }
+    };
+
+    let bytes = match stimulus::build_ai_native_sound_reference(
+        session_seed,
+        session_difficulty,
+        index,
+        &shape_id,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    ([(header::CONTENT_TYPE, "audio/wav")], bytes).into_response()
+}
+
 async fn debug_index_route() -> Html<String> {
     Html(crate::views::render_debug_navigator().into_string())
 }
@@ -1164,6 +1297,58 @@ struct SetupPayloadState {
 
 fn question_index_i32(item_index: usize) -> Result<i32> {
     i32::try_from(item_index).context("task index exceeded database limits")
+}
+
+enum ShapeReferenceResolutionError {
+    BadRequest(String),
+    InternalServer(String),
+}
+
+fn resolve_sound_shape_for_item(
+    item: &flow::PlanItem,
+    requested_shape: Option<&str>,
+) -> Result<String, ShapeReferenceResolutionError> {
+    if item.scene_shapes.is_empty() {
+        return Err(ShapeReferenceResolutionError::InternalServer(
+            "current sound question has no selectable shapes".to_string(),
+        ));
+    }
+
+    let requested_shape_id = if let Some(raw_shape) = requested_shape {
+        Some(
+            flow::parse_shape_answer(raw_shape).ok_or_else(|| {
+                ShapeReferenceResolutionError::BadRequest(
+                    "shape must be a canonical shape id or natural label (for example red circle)"
+                        .to_string(),
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let fallback_shape_id = requested_shape_id
+        .or_else(|| item.query_shape.clone())
+        .or_else(|| item.scene_shapes.first().map(|shape| shape.shape_id.clone()));
+
+    let fallback_shape_id = match fallback_shape_id {
+        Some(value) => value,
+        None => {
+            return Err(ShapeReferenceResolutionError::InternalServer(
+                "current sound question has no selectable shapes".to_string(),
+            ))
+        }
+    };
+
+    item.scene_shapes
+        .iter()
+        .find(|shape| shape.shape_id == fallback_shape_id)
+        .map(|shape| shape.shape_id.clone())
+        .ok_or_else(|| {
+            ShapeReferenceResolutionError::BadRequest(
+                "requested sound shape is not part of the current scene".to_string(),
+            )
+        })
 }
 
 #[cfg(test)]

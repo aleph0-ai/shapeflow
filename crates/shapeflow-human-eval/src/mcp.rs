@@ -16,6 +16,7 @@ use crate::{db, db::DbPool, flow, flow::Difficulty, stimulus};
 
 const WEB_SESSION_SEED_MIN: u64 = 1u64 << 16;
 const WEB_SESSION_SEED_MAX: u64 = (1u64 << 32) - 1;
+const SHAPES_PUBLIC_BASE_URL: &str = "https://shapes.aleph0.ai";
 
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct StartSessionArgs {
@@ -54,6 +55,14 @@ pub struct SubmitDifficultyFeedbackArgs {
     pub sound_difficulty_rating: i16,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetQuestionSoundReferenceArgs {
+    /// Session UUID returned by start_session.
+    pub session_uuid: String,
+    /// Optional shape id or natural label, defaults to the current query shape or first scene shape.
+    pub shape: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct StartSessionResponse {
     session_uuid: String,
@@ -78,6 +87,10 @@ struct QuestionResponse {
     mcp_data_tool: String,
     mcp_data_args: String,
     data_url: String,
+    available_shapes: Option<Vec<String>>,
+    sound_reference_tool: Option<String>,
+    sound_reference_args: Option<String>,
+    sound_reference_url: Option<String>,
     submit_tool: String,
     submit_instruction: String,
     final_feedback_tool: String,
@@ -97,6 +110,11 @@ struct SubmitAnswerResponse {
 struct DifficultyFeedbackResponse {
     session_uuid: String,
     status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InstructionsResponse {
+    instructions: String,
 }
 
 #[derive(Clone)]
@@ -119,6 +137,28 @@ impl HumanEvalMcpServer {
             tool_router: Self::tool_router(),
             pool: Some(pool),
         }
+    }
+
+    #[tool(
+        description = "Get mandatory MCP instructions. This should be the first tool call before starting a session."
+    )]
+    async fn get_instructions(&self) -> Result<CallToolResult, McpError> {
+        let payload = InstructionsResponse {
+            instructions: [
+                "MCP-FIRST REQUIREMENT: This tool is required before starting every session.",
+                "Call start_session only after reading these instructions.",
+                "For each question, call get_question(session_uuid=...) and then call get_question_data(session_uuid=...) first.",
+                "Prefer MCP tool data retrieval. If the MCP response cannot be naturally ingested or read by your agent, do NOT transform or decode it.",
+                "Fallback to downloading the question data from https://shapes.aleph0.ai/data/<session_uuid>/<seed>/<difficulty>/<modality>/<index> when MCP data is unusable.",
+                "For sound questions, you may call get_question_sound_reference(session_uuid=<uuid>, shape=<shape-id-or-label>) or download https://shapes.aleph0.ai/sound-reference/<session_uuid>/<seed>/<difficulty>/<index>?shape=<shape-id-or-label> for shape-reference audio.",
+                "Do not assume model identifier text. If you do not know it exactly, ask the user for the exact model identifier before continuing.",
+                "Generic labels are insufficient: \"codex session\", \"claude code\", \"openai\", \"claude\".",
+            ]
+            .join("\n"),
+        };
+        Ok(CallToolResult::success(vec![Content::text(json_text(
+            &payload,
+        ))]))
     }
 
     #[tool(description = "Create a new AI evaluation session and return session_uuid")]
@@ -159,7 +199,7 @@ impl HumanEvalMcpServer {
         let payload = StartSessionResponse {
             session_uuid,
             difficulty: difficulty.as_str().to_string(),
-            note: "Session started. Use get_question to fetch the current question and retrieval instructions.".to_string(),
+            note: "Session started. Before proceeding, ensure you have followed get_instructions (including exact model-id handling). Then follow MCP-first retrieval via get_question(session_uuid=...) and get_question_data(session_uuid=...). If the MCP question payload cannot be naturally ingested/read, use the returned data_url fallback and do not decode or transform it.".to_string(),
             next_action: "get_question(session_uuid=...)".to_string(),
         };
         Ok(CallToolResult::success(vec![Content::text(json_text(
@@ -168,7 +208,7 @@ impl HumanEvalMcpServer {
     }
 
     #[tool(
-        description = "Get the current question for a session, including data retrieval and submit instructions"
+        description = "Get the current question for a session, including MCP-native data retrieval and submit instructions"
     )]
     async fn get_question(
         &self,
@@ -196,6 +236,10 @@ impl HumanEvalMcpServer {
                 mcp_data_tool: "get_question_data".to_string(),
                 mcp_data_args: format!("session_uuid={session_uuid}"),
                 data_url: "not-applicable".to_string(),
+                available_shapes: None,
+                sound_reference_tool: None,
+                sound_reference_args: None,
+                sound_reference_url: None,
                 submit_tool: "submit_answer".to_string(),
                 submit_instruction: "No answer submission is allowed after all questions are complete.".to_string(),
                 final_feedback_tool: "submit_difficulty_feedback(session_uuid,image_difficulty_rating,video_difficulty_rating,text_difficulty_rating,tabular_difficulty_rating,sound_difficulty_rating)".to_string(),
@@ -234,6 +278,48 @@ impl HumanEvalMcpServer {
             session_uuid,
             answer_instruction_for_kind(item.answer_kind)
         );
+        let available_shapes = if item.answer_kind == flow::AnswerKind::ShapeIdentity {
+            Some(
+                item.scene_shapes
+                    .iter()
+                    .map(|choice| choice.label.clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let (sound_reference_tool, sound_reference_args, sound_reference_url) = if item.modality
+            == flow::Modality::Sound
+        {
+            let sound_shape_id = resolve_sound_shape_for_item(&item, None)?;
+            let sound_reference_url = if item.query_shape.is_some() {
+                format!(
+                    "{}/sound-reference/{}/{}/{}/{}?shape={}",
+                    SHAPES_PUBLIC_BASE_URL,
+                    session_uuid,
+                    state.seed,
+                    state.difficulty.as_str(),
+                    item.scene_index,
+                    sound_shape_id
+                )
+            } else {
+                format!(
+                    "{}/sound-reference/{}/{}/{}/{}",
+                    SHAPES_PUBLIC_BASE_URL,
+                    session_uuid,
+                    state.seed,
+                    state.difficulty.as_str(),
+                    item.scene_index
+                )
+            };
+            (
+                Some(String::from("get_question_sound_reference")),
+                Some(format!("session_uuid={session_uuid},shape={sound_shape_id}")),
+                Some(sound_reference_url),
+            )
+        } else {
+            (None, None, None)
+        };
 
         let payload = QuestionResponse {
             session_uuid: session_uuid.clone(),
@@ -247,15 +333,20 @@ impl HumanEvalMcpServer {
             answer_kind: item.answer_kind.as_str().to_string(),
             answer_hint: item.answer_hint.clone(),
             question: item.prompt.clone(),
+            available_shapes,
             mcp_data_tool: "get_question_data".to_string(),
             mcp_data_args: format!("session_uuid={session_uuid}"),
             data_url: format!(
-                "/data/{session_uuid}/{seed}/{difficulty}/{modality}/{idx}",
+                "{}/data/{session_uuid}/{seed}/{difficulty}/{modality}/{idx}",
+                SHAPES_PUBLIC_BASE_URL,
                 seed = state.seed,
                 difficulty = state.difficulty.as_str(),
                 modality = item.modality.as_str(),
                 idx = item.scene_index
             ),
+            sound_reference_tool,
+            sound_reference_args,
+            sound_reference_url,
             submit_tool: "submit_answer".to_string(),
             submit_instruction,
             final_feedback_tool: "submit_difficulty_feedback(session_uuid,image_difficulty_rating,video_difficulty_rating,text_difficulty_rating,tabular_difficulty_rating,sound_difficulty_rating)".to_string(),
@@ -330,6 +421,51 @@ impl HumanEvalMcpServer {
             }
         };
         Ok(result)
+    }
+
+    #[tool(
+        description = "Fetch shape-specific sound reference for current sound question. Optional shape can be canonical id or natural label."
+    )]
+    async fn get_question_sound_reference(
+        &self,
+        Parameters(args): Parameters<GetQuestionSoundReferenceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pool = self.db_pool()?;
+        let session_uuid = normalize_session_uuid(&args.session_uuid)?;
+        let state = self
+            .load_current_question_state(pool, &session_uuid)
+            .await?;
+        let item = state.plan_item.ok_or_else(|| {
+            McpError::invalid_params(
+                "all questions are complete; submit final feedback instead",
+                None,
+            )
+        })?;
+
+        if item.modality != flow::Modality::Sound {
+            return Err(McpError::invalid_params(
+                "sound references are only available for sound questions",
+                None,
+            ));
+        }
+
+        let shape_id =
+            resolve_sound_shape_for_item(&item, args.shape.as_deref())?;
+        let wav = stimulus::build_ai_native_sound_reference(
+            state.seed,
+            state.difficulty,
+            item.scene_index,
+            &shape_id,
+        )
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+
+        let blob = STANDARD.encode(&wav);
+        let content = vec![RawContent::Audio(RawAudioContent {
+            data: blob,
+            mime_type: "audio/wav".to_string(),
+        })
+        .no_annotation()];
+        Ok(CallToolResult::success(content))
     }
 
     #[tool(description = "Submit answer for current question and advance session to next question")]
@@ -469,7 +605,7 @@ impl ServerHandler for HumanEvalMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Preferred MCP test flow: start_session -> get_question -> get_question_data -> submit_answer (repeat) -> submit_difficulty_feedback. Use used_tools=true when external scripts/tools were used to derive an answer."
+                "Preferred policy: call get_instructions first, then use start_session -> get_question -> get_question_data -> submit_answer (repeat) -> submit_difficulty_feedback. If MCP question data cannot be naturally ingested/read, use get_question_data's fallback data_url and do not decode or transform it. For sound questions, also use get_question_sound_reference(session_uuid=<uuid>, shape=<shape-id-or-label>) or https://shapes.aleph0.ai/sound-reference/<session_uuid>/<seed>/<difficulty>/<index>?shape=<shape-id-or-label>. Do not assume any model identifier; ask for the exact identifier before continuing."
                     .to_string(),
             )
     }
@@ -666,6 +802,50 @@ fn compare_answer(
     } else {
         (false, "Incorrect".to_string())
     }
+}
+
+fn resolve_sound_shape_for_item(
+    item: &flow::PlanItem,
+    requested_shape: Option<&str>,
+) -> Result<String, McpError> {
+    if item.scene_shapes.is_empty() {
+        return Err(McpError::internal_error(
+            "current sound question has no selectable shapes",
+            None,
+        ));
+    }
+
+    let requested_shape_id = if let Some(raw_shape) = requested_shape {
+        Some(
+            flow::parse_shape_answer(raw_shape).ok_or_else(|| {
+                McpError::invalid_params(
+                    "shape must be a canonical shape id or natural label (for example red circle)",
+                    None,
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let fallback_shape_id = requested_shape_id
+        .or_else(|| item.query_shape.clone())
+        .or_else(|| item.scene_shapes.first().map(|shape| shape.shape_id.clone()));
+
+    let fallback_shape_id = fallback_shape_id.ok_or_else(|| {
+        McpError::internal_error("current sound question has no selectable shapes", None)
+    })?;
+
+    item.scene_shapes
+        .iter()
+        .find(|shape| shape.shape_id == fallback_shape_id)
+        .map(|shape| shape.shape_id.clone())
+        .ok_or_else(|| {
+            McpError::invalid_params(
+                "requested sound shape is not part of the current scene",
+                None,
+            )
+        })
 }
 
 fn valid_unique_rating_permutation(values: [i16; 5]) -> bool {
